@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import tkinter as tk
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -84,7 +85,7 @@ class SkillWriterApp:
         self.environment_check_service = EnvironmentCheckService()
         self.local_script_runner = LocalScriptRunner()
         self.log_sanitizer = LogSanitizer()
-        family_skill_path = self.bundled_skill_service.installed_skill_path("family-battle-skill-writer")
+        family_skill_path = self.bundled_skill_service.bundled_skills_dir() / "family-battle-skill-writer"
         self.writeback_service = ExcelWritebackService(
             str(family_skill_path / "scripts" / "write_temp_skill_excel.py")
         )
@@ -148,6 +149,7 @@ class SkillWriterApp:
         self.constraints_text: tk.Text
         self.prompt_text: tk.Text
         self.log_text: tk.Text
+        self.workbench_log_text: tk.Text
         self.model_note_text: tk.Text
         self.model_recommend_text: tk.Text
         self.payload_listbox: tk.Listbox
@@ -185,6 +187,9 @@ class SkillWriterApp:
         self.current_task_artifacts: list[Path] = []
         self.history_entries: list[TaskHistoryEntry] = []
         self.history_display_rows: list[dict[str, object]] = []
+        self.payload_listboxes: list[tk.Listbox] = []
+        self.task_dir_listboxes: list[tk.Listbox] = []
+        self.syncing_recent_lists: bool = False
         self.active_repair_entry: TaskHistoryEntry | None = None
         self.repair_attachment_paths: list[str] = []
         self.pending_repair_chat_path: Path | None = None
@@ -303,10 +308,11 @@ class SkillWriterApp:
         ttk.Label(header, textvariable=self.elapsed_var).grid(row=1, column=3, sticky="w", pady=(8, 0))
         ttk.Label(header, text="最近日志").grid(row=1, column=4, sticky="e", pady=(8, 0))
         ttk.Label(header, textvariable=self.last_log_time_var).grid(row=1, column=5, sticky="w", padx=8, pady=(8, 0))
+        ttk.Button(header, text="查看日志", command=self.show_log_tab).grid(row=1, column=6, sticky="e", pady=(8, 0))
         ttk.Label(header, textvariable=self.runtime_hint_var).grid(
             row=2,
             column=0,
-            columnspan=6,
+            columnspan=7,
             sticky="w",
             pady=(6, 0),
         )
@@ -466,6 +472,20 @@ class SkillWriterApp:
         self.health_text.grid(row=2, column=0, sticky="nsew", padx=6, pady=(2, 6))
         self.health_text.configure(state="disabled")
 
+        recent_log_frame = ttk.LabelFrame(run_frame, text="最近日志")
+        recent_log_frame.grid(row=9, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        recent_log_frame.columnconfigure(0, weight=1)
+        recent_log_frame.rowconfigure(1, weight=1)
+        recent_log_actions = ttk.Frame(recent_log_frame)
+        recent_log_actions.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 2))
+        ttk.Button(recent_log_actions, text="查看完整日志页", command=self.show_log_tab).pack(side="left")
+        ttk.Button(recent_log_actions, text="打开日志文件", command=self.open_full_log_file).pack(side="left", padx=6)
+        self.workbench_log_text = tk.Text(recent_log_frame, height=6, wrap="word")
+        self.workbench_log_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 6))
+        recent_log_scroll = ttk.Scrollbar(recent_log_frame, orient="vertical", command=self.workbench_log_text.yview)
+        recent_log_scroll.grid(row=1, column=1, sticky="ns", pady=(2, 6))
+        self.workbench_log_text.configure(yscrollcommand=recent_log_scroll.set, state="disabled")
+
         result_frame = ttk.LabelFrame(frame, text="结果")
         result_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(10, 8))
         result_frame.columnconfigure(0, weight=2)
@@ -506,6 +526,7 @@ class SkillWriterApp:
         payload_box.columnconfigure(0, weight=1)
         payload_box.rowconfigure(0, weight=1)
         self.payload_listbox = tk.Listbox(payload_box, exportselection=False, height=7)
+        self.payload_listboxes.append(self.payload_listbox)
         self.payload_listbox.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.payload_listbox.bind("<<ListboxSelect>>", self.on_recent_payload_select)
         payload_scroll = ttk.Scrollbar(payload_box, orient="vertical", command=self.payload_listbox.yview)
@@ -513,7 +534,7 @@ class SkillWriterApp:
         self.payload_listbox.configure(yscrollcommand=payload_scroll.set)
         payload_actions = ttk.Frame(payload_box)
         payload_actions.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-        ttk.Button(payload_actions, text="使用", command=self.use_selected_payload).pack(side="left")
+        ttk.Button(payload_actions, text="使用", command=lambda lb=self.payload_listbox: self.use_selected_payload(lb)).pack(side="left")
         ttk.Button(payload_actions, text="打开", command=self.open_selected_payload).pack(side="left", padx=6)
         ttk.Button(payload_actions, text="刷新", command=self.refresh_temp_workspace_views).pack(side="left", padx=6)
 
@@ -522,6 +543,7 @@ class SkillWriterApp:
         task_box.columnconfigure(0, weight=1)
         task_box.rowconfigure(0, weight=1)
         self.task_dir_listbox = tk.Listbox(task_box, exportselection=False, height=7)
+        self.task_dir_listboxes.append(self.task_dir_listbox)
         self.task_dir_listbox.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.task_dir_listbox.bind("<<ListboxSelect>>", self.on_recent_task_dir_select)
         task_scroll = ttk.Scrollbar(task_box, orient="vertical", command=self.task_dir_listbox.yview)
@@ -529,8 +551,8 @@ class SkillWriterApp:
         self.task_dir_listbox.configure(yscrollcommand=task_scroll.set)
         task_actions = ttk.Frame(task_box)
         task_actions.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-        ttk.Button(task_actions, text="使用", command=self.use_selected_task_dir).pack(side="left")
-        ttk.Button(task_actions, text="打开", command=self.open_selected_task_dir).pack(side="left", padx=6)
+        ttk.Button(task_actions, text="使用", command=lambda lb=self.task_dir_listbox: self.use_selected_task_dir(lb)).pack(side="left")
+        ttk.Button(task_actions, text="打开", command=lambda lb=self.task_dir_listbox: self.open_selected_task_dir(lb)).pack(side="left", padx=6)
         ttk.Button(task_actions, text="刷新", command=self.refresh_temp_workspace_views).pack(side="left", padx=6)
 
         advanced_bar = ttk.Frame(frame)
@@ -765,6 +787,7 @@ class SkillWriterApp:
         recent_payload_frame.rowconfigure(0, weight=1)
 
         self.payload_listbox = tk.Listbox(recent_payload_frame, exportselection=False, height=7)
+        self.payload_listboxes.append(self.payload_listbox)
         self.payload_listbox.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.payload_listbox.bind("<<ListboxSelect>>", self.on_recent_payload_select)
         payload_scroll = ttk.Scrollbar(recent_payload_frame, orient="vertical", command=self.payload_listbox.yview)
@@ -773,7 +796,7 @@ class SkillWriterApp:
 
         payload_actions = ttk.Frame(recent_payload_frame)
         payload_actions.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-        ttk.Button(payload_actions, text="使用选中项", command=self.use_selected_payload).pack(side="left")
+        ttk.Button(payload_actions, text="使用选中项", command=lambda lb=self.payload_listbox: self.use_selected_payload(lb)).pack(side="left")
         ttk.Button(payload_actions, text="打开文件", command=self.open_selected_payload).pack(side="left", padx=6)
         ttk.Button(payload_actions, text="刷新列表", command=self.refresh_temp_workspace_views).pack(side="left", padx=6)
 
@@ -783,6 +806,7 @@ class SkillWriterApp:
         recent_task_frame.rowconfigure(0, weight=1)
 
         self.task_dir_listbox = tk.Listbox(recent_task_frame, exportselection=False, height=7)
+        self.task_dir_listboxes.append(self.task_dir_listbox)
         self.task_dir_listbox.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         self.task_dir_listbox.bind("<<ListboxSelect>>", self.on_recent_task_dir_select)
         task_scroll = ttk.Scrollbar(recent_task_frame, orient="vertical", command=self.task_dir_listbox.yview)
@@ -791,8 +815,8 @@ class SkillWriterApp:
 
         task_actions = ttk.Frame(recent_task_frame)
         task_actions.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-        ttk.Button(task_actions, text="使用选中项", command=self.use_selected_task_dir).pack(side="left")
-        ttk.Button(task_actions, text="打开目录", command=self.open_selected_task_dir).pack(side="left", padx=6)
+        ttk.Button(task_actions, text="使用选中项", command=lambda lb=self.task_dir_listbox: self.use_selected_task_dir(lb)).pack(side="left")
+        ttk.Button(task_actions, text="打开目录", command=lambda lb=self.task_dir_listbox: self.open_selected_task_dir(lb)).pack(side="left", padx=6)
         ttk.Button(task_actions, text="刷新列表", command=self.refresh_temp_workspace_views).pack(side="left", padx=6)
 
         ttk.Separator(frame, orient="horizontal").grid(row=9, column=0, columnspan=4, sticky="ew", pady=10)
@@ -1504,6 +1528,7 @@ class SkillWriterApp:
         def worker() -> None:
             items = [
                 self.environment_check_service.check_python(python_executable),
+                self.environment_check_service.check_python_dependencies(python_executable, auto_install=True),
                 self.environment_check_service.check_command("Codex CLI", codex_executable, ["--version"]),
                 self.environment_check_service.check_command("Claude CLI", claude_executable, ["--version"]),
                 self.environment_check_service.check_path("工作区", workspace_root, must_be_dir=True),
@@ -1652,8 +1677,10 @@ class SkillWriterApp:
         self.recent_payloads = []
         self.recent_task_dirs = []
         self.current_task_artifacts = []
-        self.payload_listbox.delete(0, "end")
-        self.task_dir_listbox.delete(0, "end")
+        for listbox in self.payload_listboxes:
+            listbox.delete(0, "end")
+        for listbox in self.task_dir_listboxes:
+            listbox.delete(0, "end")
         self.artifact_listbox.delete(0, "end")
         self.artifact_summary_var.set("当前没有任务产物")
         self.update_action_buttons()
@@ -1725,18 +1752,28 @@ class SkillWriterApp:
         self.update_action_buttons()
 
     def fill_payload_listbox(self, selected_path: str) -> None:
-        self.payload_listbox.delete(0, "end")
-        for index, path in enumerate(self.recent_payloads):
-            self.payload_listbox.insert("end", self.format_recent_path(path))
-            if selected_path and Path(selected_path) == path:
-                self.payload_listbox.selection_set(index)
+        self.syncing_recent_lists = True
+        try:
+            for listbox in self.payload_listboxes:
+                listbox.delete(0, "end")
+                for index, path in enumerate(self.recent_payloads):
+                    listbox.insert("end", self.format_recent_path(path))
+                    if selected_path and Path(selected_path) == path:
+                        listbox.selection_set(index)
+        finally:
+            self.syncing_recent_lists = False
 
     def fill_task_dir_listbox(self, selected_path: str) -> None:
-        self.task_dir_listbox.delete(0, "end")
-        for index, path in enumerate(self.recent_task_dirs):
-            self.task_dir_listbox.insert("end", self.format_recent_path(path))
-            if selected_path and Path(selected_path) == path:
-                self.task_dir_listbox.selection_set(index)
+        self.syncing_recent_lists = True
+        try:
+            for listbox in self.task_dir_listboxes:
+                listbox.delete(0, "end")
+                for index, path in enumerate(self.recent_task_dirs):
+                    listbox.insert("end", self.format_recent_path(path))
+                    if selected_path and Path(selected_path) == path:
+                        listbox.selection_set(index)
+        finally:
+            self.syncing_recent_lists = False
 
     def refresh_current_task_artifacts(self) -> None:
         task_dir = self.latest_task_dir_var.get().strip()
@@ -1793,16 +1830,23 @@ class SkillWriterApp:
         normalized_payload = self.normalize_path(payload_path)
         self.payload_var.set(normalized_payload)
 
+        selected_task_dir = ""
         if normalized_payload and self.path_belongs_to_current_temp_workspace(normalized_payload):
             payload_parent = self.workspace_manager.task_dir_for_payload(normalized_payload)
             temp_root = self.workspace_manager.temp_workspace_path(self.workspace_var.get().strip())
             if temp_root and payload_parent != temp_root:
-                self.latest_task_dir_var.set(str(payload_parent))
-                self.set_task_local_excel_dirs(str(payload_parent))
+                selected_task_dir = str(payload_parent)
+                self.latest_task_dir_var.set(selected_task_dir)
+                self.set_task_local_excel_dirs(selected_task_dir)
             else:
                 self.latest_task_dir_var.set("")
 
+        if selected_task_dir:
+            self.load_task_context_into_editor(selected_task_dir)
         self.refresh_current_task_artifacts()
+        self.fill_payload_listbox(normalized_payload)
+        if self.latest_task_dir_var.get().strip():
+            self.fill_task_dir_listbox(self.latest_task_dir_var.get().strip())
         self.update_action_buttons()
 
     def sync_task_dir_selection(self, task_dir: str) -> None:
@@ -1817,8 +1861,81 @@ class SkillWriterApp:
             self.workspace_manager.ensure_task_layout(normalized_task_dir)
             self.payload_var.set(str(self.workspace_manager.canonical_task_file(normalized_task_dir, "temp_excel_payload.json")))
 
+        self.load_task_context_into_editor(normalized_task_dir)
         self.refresh_current_task_artifacts()
+        self.fill_task_dir_listbox(normalized_task_dir)
+        self.fill_payload_listbox(self.payload_var.get().strip())
         self.update_action_buttons()
+
+    def load_task_context(self, task_dir: str) -> dict[str, str]:
+        if not task_dir or not Path(task_dir).exists():
+            return {}
+        state = self.task_handoff_service.load_state(task_dir)
+        memory = self.task_handoff_service.load_memory(task_dir)
+        handoff = self.task_handoff_service.read_handoff(task_dir)
+
+        def pick(*values: object) -> str:
+            for value in values:
+                text = str(value or "").strip()
+                if text and text.lower() != "(none)":
+                    return text
+            return ""
+
+        requirement = pick(
+            state.get("skill_description"),
+            memory.get("requirement"),
+            self.extract_markdown_section(handoff, "Original Requirement"),
+        )
+        constraints = pick(
+            state.get("additional_constraints"),
+            memory.get("constraints"),
+            self.extract_markdown_section(handoff, "Constraints"),
+        )
+        return {
+            "requirement": requirement,
+            "constraints": constraints,
+            "agent_backend": pick(state.get("agent_backend"), memory.get("agent_backend"), self.agent_backend_var.get()),
+            "model_name": pick(state.get("model_name"), memory.get("model_name")),
+            "session_id": pick(state.get("session_id"), memory.get("session_id")),
+            "updated_at": pick(state.get("updated_at"), memory.get("updated_at")),
+            "status": pick(state.get("status"), memory.get("status")),
+        }
+
+    def extract_markdown_section(self, text: str, heading: str) -> str:
+        if not text:
+            return ""
+        marker = f"## {heading}"
+        start = text.find(marker)
+        if start < 0:
+            return ""
+        start = text.find("\n", start)
+        if start < 0:
+            return ""
+        end = text.find("\n## ", start + 1)
+        section = text[start:end if end >= 0 else len(text)].strip()
+        return section
+
+    def load_task_context_into_editor(self, task_dir: str) -> None:
+        context = self.load_task_context(task_dir)
+        if not context:
+            return
+        changed = False
+        self.suppress_requirement_change = True
+        try:
+            if context.get("requirement"):
+                self.description_text.delete("1.0", "end")
+                self.description_text.insert("1.0", context["requirement"])
+                changed = True
+            if context.get("constraints"):
+                self.constraints_text.delete("1.0", "end")
+                self.constraints_text.insert("1.0", context["constraints"])
+                changed = True
+            if changed:
+                self.refresh_prompt()
+                self.accept_current_requirement_context()
+                self.append_log(f"[workflow-resume] 已从任务目录回填技能描述: {task_dir}")
+        finally:
+            self.suppress_requirement_change = False
 
     def restore_active_task_selection(self) -> None:
         workspace_root = self.workspace_var.get().strip()
@@ -1837,6 +1954,7 @@ class SkillWriterApp:
         payload = str(latest.get("payload_path", "") or "")
         if task_dir and Path(task_dir).exists():
             self.latest_task_dir_var.set(task_dir)
+            self.load_task_context_into_editor(task_dir)
         if payload and Path(payload).exists():
             self.payload_var.set(payload)
         if task_dir or payload:
@@ -1983,19 +2101,25 @@ class SkillWriterApp:
         return keys
 
     def find_resumable_develop_task(self, prompt: str) -> tuple[str, dict[str, object]] | None:
+        current_target = self.current_target_key()
+        target_keys = self.active_task_target_keys(prompt)
         matched = self.active_task_service.find_resumable(
             step="develop",
-            target_keys=self.active_task_target_keys(prompt),
+            target_keys=target_keys,
             workspace_root=self.workspace_var.get().strip(),
             prompt_hash=self.prompt_hash(prompt),
+            allow_workspace_fallback=not bool(current_target),
         )
         if matched:
             return matched
+        if current_target:
+            return None
         return self.active_task_service.find_resumable(
             step="develop",
             target_keys=self.active_task_target_keys(""),
             workspace_root=self.workspace_var.get().strip(),
             prompt_hash="",
+            allow_workspace_fallback=True,
         )
 
     def build_resume_develop_prompt(self, original_prompt: str, task_info: dict[str, object]) -> str:
@@ -2746,6 +2870,8 @@ class SkillWriterApp:
                 detail += f"\n\n错误详情:\n{self.last_task_error_message}"
             self.stop_serial_workflow(f"串行流程终止：步骤“{task_name}”执行失败。")
             self.update_action_buttons()
+            detail += f"\n\n完整日志:\n{self.full_log_path}"
+            self.show_log_tab()
             messagebox.showwarning("提示", detail)
             return True
 
@@ -2913,8 +3039,9 @@ class SkillWriterApp:
         elif action == "real":
             self.write_excel_real()
 
-    def get_selected_payload(self) -> Path | None:
-        selection = self.payload_listbox.curselection()
+    def get_selected_payload(self, listbox: tk.Listbox | None = None) -> Path | None:
+        source = listbox or self.payload_listbox
+        selection = source.curselection()
         if not selection:
             if self.payload_var.get().strip():
                 return Path(self.payload_var.get().strip())
@@ -2924,8 +3051,9 @@ class SkillWriterApp:
             return None
         return self.recent_payloads[index]
 
-    def get_selected_task_dir(self) -> Path | None:
-        selection = self.task_dir_listbox.curselection()
+    def get_selected_task_dir(self, listbox: tk.Listbox | None = None) -> Path | None:
+        source = listbox or self.task_dir_listbox
+        selection = source.curselection()
         if not selection:
             if self.latest_task_dir_var.get().strip():
                 return Path(self.latest_task_dir_var.get().strip())
@@ -2936,25 +3064,31 @@ class SkillWriterApp:
         return self.recent_task_dirs[index]
 
     def on_recent_payload_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
-        selected = self.get_selected_payload()
+        if self.syncing_recent_lists:
+            return
+        source = _event.widget if _event and isinstance(_event.widget, tk.Listbox) else None
+        selected = self.get_selected_payload(source)
         if selected:
             self.sync_payload_selection(str(selected))
 
     def on_recent_task_dir_select(self, _event: tk.Event[tk.Misc] | None = None) -> None:
-        selected = self.get_selected_task_dir()
+        if self.syncing_recent_lists:
+            return
+        source = _event.widget if _event and isinstance(_event.widget, tk.Listbox) else None
+        selected = self.get_selected_task_dir(source)
         if selected:
             self.sync_task_dir_selection(str(selected))
 
-    def use_selected_payload(self) -> None:
-        selected = self.get_selected_payload()
+    def use_selected_payload(self, listbox: tk.Listbox | None = None) -> None:
+        selected = self.get_selected_payload(listbox)
         if not selected:
             messagebox.showwarning("提示", "当前没有可用的 payload 记录")
             return
         self.sync_payload_selection(str(selected))
         self.status_var.set("已选择 payload")
 
-    def use_selected_task_dir(self) -> None:
-        selected = self.get_selected_task_dir()
+    def use_selected_task_dir(self, listbox: tk.Listbox | None = None) -> None:
+        selected = self.get_selected_task_dir(listbox)
         if not selected:
             messagebox.showwarning("提示", "当前没有可用的任务目录")
             return
@@ -2983,8 +3117,8 @@ class SkillWriterApp:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("错误", str(exc))
 
-    def open_selected_task_dir(self) -> None:
-        path = self.get_selected_task_dir()
+    def open_selected_task_dir(self, listbox: tk.Listbox | None = None) -> None:
+        path = self.get_selected_task_dir(listbox)
         if not path:
             messagebox.showwarning("提示", "当前没有可打开的任务目录")
             return
@@ -3519,6 +3653,14 @@ class SkillWriterApp:
         if not task_dir and not payload:
             messagebox.showwarning("提示", "当前还没有任务目录或 payload。")
             return
+        if not self.history_entries:
+            entry = self.build_repair_entry_from_current_task()
+            if entry:
+                self.activate_repair_session(entry)
+                if hasattr(self, "notebook"):
+                    self.notebook.select(1)
+                messagebox.showinfo("修复会话", "已基于当前任务目录创建修复会话，可以继续发送修复消息。")
+                return
         for entry in self.history_entries:
             if self.history_matches_current_target(entry, self.normalize_path(task_dir), self.normalize_path(payload)):
                 self.activate_repair_session(entry)
@@ -3526,9 +3668,55 @@ class SkillWriterApp:
                     self.notebook.select(1)
                 messagebox.showinfo("修复会话", "已切换到“技能会话”，可以连续粘贴日志/截图并发送。")
                 return
+        entry = self.build_repair_entry_from_current_task()
+        if entry:
+            self.activate_repair_session(entry)
+            if hasattr(self, "notebook"):
+                self.notebook.select(1)
+            messagebox.showinfo("修复会话", "没有匹配到本机历史，已改用当前任务目录创建修复会话。")
+            return
         messagebox.showwarning("提示", "没有找到当前任务对应的历史记录，请先刷新历史或在技能会话里手动选择。")
 
+    def build_repair_entry_from_current_task(self) -> TaskHistoryEntry | None:
+        task_dir = self.latest_task_dir_var.get().strip()
+        payload = self.payload_var.get().strip()
+        if not task_dir and payload:
+            task_dir = str(self.workspace_manager.task_dir_for_payload(payload))
+        context = self.load_task_context(task_dir) if task_dir else {}
+        if not context and not payload:
+            return None
+        if not payload and task_dir:
+            discovered = self.workspace_manager.find_primary_payload_for_dir(task_dir)
+            payload = str(discovered) if discovered else ""
+        artifacts = [str(path) for path in self.workspace_manager.find_task_artifacts(task_dir, limit=40)] if task_dir else []
+        return TaskHistoryEntry(
+            timestamp=context.get("updated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            task_name="技能开发",
+            status_code=0 if context.get("status") == "completed" else -1,
+            status_text=context.get("status") or "local-task",
+            workspace_root=self.workspace_var.get().strip(),
+            battle_root=self.battle_root_var.get().strip(),
+            template_name=self.current_template_key(),
+            scene_label=self.scene_var.get().strip(),
+            agent_backend=context.get("agent_backend") or self.agent_backend_var.get().strip() or "codex",
+            model_preset_key=self.model_preset_key_var.get().strip(),
+            model_name=context.get("model_name") or (self.claude_model_var.get().strip() if self.agent_backend_var.get() == "claude" else self.codex_model_var.get().strip()),
+            codex_extra_args=self.claude_extra_args_var.get().strip() if self.agent_backend_var.get() == "claude" else self.codex_extra_args_var.get().strip(),
+            payload_path=payload,
+            task_dir=task_dir,
+            output_file=str(self.default_output_file()),
+            archive_dir="",
+            skill_description=context.get("requirement") or self.get_text(self.description_text),
+            protected_files=self.get_text(self.protected_text),
+            additional_constraints=context.get("constraints") or self.get_text(self.constraints_text),
+            dedupe_existing=self.dedupe_var.get(),
+            session_id=context.get("session_id", ""),
+            session_file="",
+            artifacts=artifacts,
+        )
+
     def activate_repair_session(self, entry: TaskHistoryEntry) -> None:
+        entry = self.repair_entry_with_local_context(entry)
         self.active_repair_entry = entry
         self.repair_session_var.set(
             f"当前会话：{self.extract_skill_title(entry.skill_description)} | {entry.timestamp}"
@@ -3545,9 +3733,52 @@ class SkillWriterApp:
         if entry.task_dir:
             self.latest_task_dir_var.set(entry.task_dir)
             self.workspace_manager.ensure_task_layout(entry.task_dir)
+        self.suppress_requirement_change = True
+        try:
+            if entry.skill_description:
+                self.description_text.delete("1.0", "end")
+                self.description_text.insert("1.0", entry.skill_description)
+            if entry.additional_constraints:
+                self.constraints_text.delete("1.0", "end")
+                self.constraints_text.insert("1.0", entry.additional_constraints)
+            self.refresh_prompt()
+            self.accept_current_requirement_context()
+        finally:
+            self.suppress_requirement_change = False
         self.status_var.set("已选择修复会话")
         self.show_repair_chat_for_entry(entry)
         self.append_log(f"[repair] 已选择修复会话: {entry.task_dir or entry.payload_path or entry.timestamp}")
+
+    def repair_entry_with_local_context(self, entry: TaskHistoryEntry) -> TaskHistoryEntry:
+        task_dir = entry.task_dir.strip()
+        payload = entry.payload_path.strip()
+        if not task_dir and payload:
+            task_dir = str(self.workspace_manager.task_dir_for_payload(payload))
+        if not task_dir:
+            current_task_dir = self.latest_task_dir_var.get().strip()
+            if current_task_dir and Path(current_task_dir).exists():
+                task_dir = current_task_dir
+        if not payload and task_dir:
+            discovered = self.workspace_manager.find_primary_payload_for_dir(task_dir)
+            if discovered:
+                payload = str(discovered)
+        context = self.load_task_context(task_dir) if task_dir else {}
+        return replace(
+            entry,
+            task_dir=task_dir,
+            payload_path=payload,
+            workspace_root=entry.workspace_root or self.workspace_var.get().strip(),
+            battle_root=entry.battle_root or self.battle_root_var.get().strip(),
+            agent_backend=entry.agent_backend or context.get("agent_backend") or self.agent_backend_var.get().strip() or "codex",
+            model_name=entry.model_name or context.get("model_name") or (
+                self.claude_model_var.get().strip()
+                if self.agent_backend_var.get() == "claude"
+                else self.codex_model_var.get().strip()
+            ),
+            skill_description=entry.skill_description or context.get("requirement") or self.get_text(self.description_text),
+            additional_constraints=entry.additional_constraints or context.get("constraints") or self.get_text(self.constraints_text),
+            session_id=entry.session_id or context.get("session_id", ""),
+        )
 
     def add_repair_session_attachments(self) -> None:
         selected = filedialog.askopenfilenames(
@@ -3874,6 +4105,7 @@ class SkillWriterApp:
         self.clear_repair_session_attachments()
 
     def start_repair_fix(self, entry: TaskHistoryEntry, issue_text: str, attachment_paths: list[str]) -> None:
+        entry = self.repair_entry_with_local_context(entry)
         self.active_repair_entry = entry
         self.workspace_var.set(entry.workspace_root or self.workspace_var.get())
         if entry.payload_path:
@@ -3922,8 +4154,11 @@ class SkillWriterApp:
         run_prompt = self.prompt_for_current_backend(self.build_history_fix_prompt(entry, issue_text, attachments))
         active_key = (self.normalize_path(entry.task_dir) or self.normalize_path(entry.payload_path) or self.develop_resume_key(run_prompt)) + "::fix"
         same_backend = (entry.agent_backend or "codex") == (self.agent_backend_var.get().strip() or "codex")
-        resume_session_id = entry.session_id.strip() if same_backend else ""
-        resume_last = same_backend and not bool(resume_session_id)
+        has_local_context = bool(entry.task_dir or entry.payload_path or entry.archive_dir)
+        resume_session_id = entry.session_id.strip() if same_backend and not has_local_context else ""
+        resume_last = same_backend and not bool(resume_session_id) and not has_local_context
+        if same_backend and has_local_context:
+            self.append_log("[repair] 当前任务没有记录原 session_id，将使用本地任务目录上下文开启修复，不续接最近 session。")
         if resume_last:
             confirm = messagebox.askyesno(
                 "未记录 session",
@@ -4113,9 +4348,34 @@ class SkillWriterApp:
             self.log_text.insert("end", "\n")
         self.trim_log_if_needed()
         self.log_text.see("end")
+        self.append_workbench_log(text)
+
+    def append_workbench_log(self, text: str) -> None:
+        if not hasattr(self, "workbench_log_text"):
+            return
+        self.workbench_log_text.configure(state="normal")
+        self.workbench_log_text.insert("end", text)
+        if not text.endswith("\n"):
+            self.workbench_log_text.insert("end", "\n")
+        self.trim_text_widget_lines(self.workbench_log_text, 300)
+        self.workbench_log_text.see("end")
+        self.workbench_log_text.configure(state="disabled")
+
+    def show_log_tab(self) -> None:
+        if hasattr(self, "notebook"):
+            try:
+                self.notebook.select(2)
+            except Exception:  # noqa: BLE001
+                return
+        if hasattr(self, "log_text"):
+            self.log_text.see("end")
 
     def clear_visible_log(self) -> None:
         self.log_text.delete("1.0", "end")
+        if hasattr(self, "workbench_log_text"):
+            self.workbench_log_text.configure(state="normal")
+            self.workbench_log_text.delete("1.0", "end")
+            self.workbench_log_text.configure(state="disabled")
         self.write_full_log("[log-ui] visible log cleared\n")
 
     def open_full_log_file(self) -> None:
@@ -4199,14 +4459,17 @@ class SkillWriterApp:
                 self.append_log("\n".join(safe_lines) + "\n")
 
     def trim_log_if_needed(self) -> None:
+        self.trim_text_widget_lines(self.log_text, self.LOG_MAX_LINES)
+
+    def trim_text_widget_lines(self, widget: tk.Text, max_lines: int) -> None:
         try:
-            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            line_count = int(widget.index("end-1c").split(".")[0])
         except Exception:  # noqa: BLE001
             return
-        if line_count <= self.LOG_MAX_LINES:
+        if line_count <= max_lines:
             return
-        lines_to_trim = line_count - self.LOG_MAX_LINES
-        self.log_text.delete("1.0", f"{lines_to_trim + 1}.0")
+        lines_to_trim = line_count - max_lines
+        widget.delete("1.0", f"{lines_to_trim + 1}.0")
 
     def validate_workspace(self) -> bool:
         if not self.workspace_var.get().strip():
@@ -4377,22 +4640,33 @@ class SkillWriterApp:
             run_prompt = self.build_resume_develop_prompt(prompt, resume_info)
             task_dir = str(resume_info.get("task_dir", "") or "")
             payload_path = str(resume_info.get("payload_path", "") or "")
-            if task_dir and Path(task_dir).exists():
-                self.latest_task_dir_var.set(task_dir)
-            if payload_path and Path(payload_path).exists():
-                self.payload_var.set(payload_path)
-            self.append_log(
-                "[workflow-resume] 命中未完成的技能开发任务，"
-                + (
-                    f"同后端续接 session={resume_session_id}"
-                    if resume_session_id
-                    else (
-                        f"后端已从 {previous_backend} 切到 {current_backend}，改用本地任务上下文接力"
-                        if previous_backend != current_backend
-                        else f"将尝试续接最近的 {self.current_backend_label()} session"
+            selected_task_dir = self.normalize_path(self.latest_task_dir_var.get())
+            if selected_task_dir and task_dir and self.normalize_path(task_dir) != selected_task_dir:
+                self.append_log(
+                    f"[workflow-guard] 已阻止跨任务续接：当前={selected_task_dir}，候选={task_dir}"
+                )
+                resume_match = None
+                resume_key = ""
+                resume_session_id = ""
+                resume_last = False
+                run_prompt = self.build_named_task_develop_prompt(prompt)
+            else:
+                if task_dir and Path(task_dir).exists():
+                    self.latest_task_dir_var.set(task_dir)
+                if payload_path and Path(payload_path).exists():
+                    self.payload_var.set(payload_path)
+                self.append_log(
+                    "[workflow-resume] 命中未完成的技能开发任务，"
+                    + (
+                        f"同后端续接 session={resume_session_id}"
+                        if resume_session_id
+                        else (
+                            f"后端已从 {previous_backend} 切到 {current_backend}，改用本地任务上下文接力"
+                            if previous_backend != current_backend
+                            else f"将尝试续接最近的 {self.current_backend_label()} session"
+                        )
                     )
                 )
-            )
         else:
             run_prompt = self.build_named_task_develop_prompt(prompt)
         active_key = resume_key or self.develop_resume_key(prompt)
@@ -4668,6 +4942,8 @@ class SkillWriterApp:
             detail = f"{task_name}结束，但退出码为 {code}"
             if self.last_task_error_message:
                 detail += f"\n\n错误详情:\n{self.last_task_error_message}"
+            detail += f"\n\n完整日志:\n{self.full_log_path}"
+            self.show_log_tab()
             messagebox.showwarning("提示", detail)
 
     def finalize_after_real_writeback(self) -> None:

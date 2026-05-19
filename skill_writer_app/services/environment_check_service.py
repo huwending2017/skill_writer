@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from skill_writer_app.services.process_command import normalize_windows_script_command, windows_subprocess_kwargs
+from skill_writer_app.services.python_dependency_service import RUNTIME_DEPENDENCIES, PythonDependencyService
 
 
 @dataclass
@@ -18,6 +19,9 @@ class CheckItem:
 
 
 class EnvironmentCheckService:
+    def __init__(self) -> None:
+        self.dependency_service = PythonDependencyService()
+
     def _is_current_app_executable(self, executable: str) -> bool:
         if not getattr(sys, "frozen", False):
             return False
@@ -87,6 +91,44 @@ class EnvironmentCheckService:
         if not command:
             return CheckItem("Python", False, "未找到 python；请在工具里配置本机 Python 路径")
         return self.check_command("Python", command, ["--version"])
+
+    def resolve_python(self, executable: str) -> str:
+        command = executable.strip()
+        if command:
+            path = Path(command).expanduser()
+            if path.exists():
+                return str(path.resolve())
+            resolved = shutil.which(command)
+            if resolved:
+                return resolved
+            raise FileNotFoundError(f"python executable not found: {command}")
+        resolved = shutil.which("python") or shutil.which("py") or ""
+        if not resolved:
+            raise FileNotFoundError("python executable not found")
+        return resolved
+
+    def check_python_dependencies(self, executable: str, *, auto_install: bool = True) -> CheckItem:
+        try:
+            resolved = self.resolve_python(executable)
+            if not auto_install:
+                missing = [
+                    dependency.import_name
+                    for dependency in RUNTIME_DEPENDENCIES
+                    if not self.dependency_service.has_module(resolved, dependency.import_name)
+                ]
+                return CheckItem(
+                    "Python deps",
+                    not missing,
+                    "missing=" + ",".join(missing) if missing else "all satisfied",
+                )
+            result = self.dependency_service.ensure_runtime_dependencies(
+                resolved,
+                None,
+                install_optional=True,
+            )
+            return CheckItem("Python deps", result.ok, result.summary())
+        except Exception as exc:  # noqa: BLE001
+            return CheckItem("Python deps", False, str(exc))
 
     def render(self, items: list[CheckItem]) -> str:
         lines = []

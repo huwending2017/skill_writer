@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import List, Sequence
 
+from skill_writer_app.services.process_command import resolve_windows_executable_shim, windows_executable_rank
+
 
 CODEX_COMMAND_NAMES: Sequence[str] = ("codex.exe", "codex.cmd", "codex.bat", "codex")
 
@@ -85,20 +87,15 @@ def discover_codex_candidates(preferred_path: str = "") -> list[str]:
 
 
 def rank_codex_candidates(candidates: Sequence[str]) -> list[str]:
-    return sorted(
-        candidates,
-        key=lambda item: (
-            0 if item.lower().endswith(".exe") else 1,
-            item.lower(),
-        ),
-    )
+    return sorted(candidates, key=windows_executable_rank)
 
 
 def resolve_codex_executable(preferred_path: str = "") -> str:
     ranked = rank_codex_candidates(discover_codex_candidates(preferred_path))
     for candidate in ranked:
-        if Path(candidate).exists():
-            return str(Path(candidate))
+        resolved = resolve_windows_executable_shim(candidate)
+        if Path(resolved).exists():
+            return str(Path(resolved))
 
     attempted = "\n".join(ranked) if ranked else "无候选路径"
     raise FileNotFoundError(

@@ -89,6 +89,7 @@ class ActiveTaskService:
         target_keys: list[str],
         workspace_root: str,
         prompt_hash: str = "",
+        allow_workspace_fallback: bool = True,
     ) -> tuple[str, dict[str, Any]] | None:
         runs = self.load()
         allowed_status = {"running", "interrupted", "failed"}
@@ -97,6 +98,9 @@ class ActiveTaskService:
             item = runs.get(key)
             if self._is_resumable(item, step, allowed_status):
                 return key, item
+
+        if not allow_workspace_fallback:
+            return None
 
         normalized_workspace = self._normalize_path(workspace_root)
         candidates: list[tuple[str, dict[str, Any]]] = []

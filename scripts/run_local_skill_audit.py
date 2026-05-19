@@ -20,6 +20,8 @@ from skill_artifact_utils import (
 )
 
 FORBIDDEN_RUNTIME_REFERENCES = ("test_skill_temp", "temp_skill_workspace", "roll_skill_dice")
+NON_PRODUCTION_LUA_NAMES = {"test_skill_temp.lua", "test_runtime_validation.lua", "temp_skill_config.lua"}
+TEST_LUA_PREFIXES = ("test_", "regression_", "mechanism_")
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,13 +180,21 @@ def audit_payload_shape(payload: dict[str, Any]) -> list[str]:
 def audit_production_script_contract(paths: list[Path]) -> list[str]:
     errors: list[str] = []
     for path in paths:
-        if path.name in {"test_skill_temp.lua", "test_runtime_validation.lua", "temp_skill_config.lua"}:
+        if is_non_production_lua(path):
             continue
         text = path.read_text(encoding="utf-8")
         for marker in FORBIDDEN_RUNTIME_REFERENCES:
             if marker in text:
                 errors.append(f"{path.name} 生产脚本禁止依赖临时实现: {marker}")
     return errors
+
+
+def is_non_production_lua(path: Path) -> bool:
+    if path.name in NON_PRODUCTION_LUA_NAMES:
+        return True
+    if path.parent.name == "tests":
+        return True
+    return path.name.startswith(TEST_LUA_PREFIXES)
 
 
 def audit_command_skill_notes(payload: dict[str, Any], implementation_path: Path) -> list[str]:

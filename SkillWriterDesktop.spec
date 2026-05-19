@@ -8,6 +8,7 @@ a = Analysis(
     datas=[
         ('bundled_skills', 'bundled_skills'),
         ('scripts', 'scripts'),
+        ('requirements-runtime.txt', '.'),
     ],
     hiddenimports=[],
     hookspath=[],

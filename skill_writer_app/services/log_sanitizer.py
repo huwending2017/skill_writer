@@ -38,6 +38,10 @@ class LogSanitizer:
         r"^\s*(?:[A-Za-z]:\\|/|\\\\).+\.(lua|py|js|ts|json|md|txt|xlsx?|csv)(?::\d+(?::\d+)?)?\s*$",
         re.IGNORECASE,
     )
+    EXCEL_TABLE_LIST_RE = re.compile(
+        r"^\s*.+\.xlsx?\s+(?:[A-Za-z]:\\|/|\\\\).+\.xlsx?\s*$",
+        re.IGNORECASE,
+    )
     MOJIBAKE_RE = re.compile(r"[锛涓鍙瀛鎺瑙鐨鏂浣绋]|[\ue000-\uf8ff]")
     SAFE_PREFIX_RE = re.compile(r"^\s*\[[A-Za-z0-9_-]+\]")
 
@@ -88,6 +92,8 @@ class LogSanitizer:
             return False
 
         if self.PATH_LIST_RE.match(stripped):
+            return True
+        if self.EXCEL_TABLE_LIST_RE.match(stripped):
             return True
         if self.SKILL_TAG_RE.match(stripped) or self.YAML_DIVIDER_RE.match(stripped):
             return True

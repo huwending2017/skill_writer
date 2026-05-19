@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
+from skill_writer_app.services.process_command import resolve_windows_executable_shim, windows_executable_rank
+
 
 CLAUDE_COMMAND_NAMES: Sequence[str] = ("claude.exe", "claude.cmd", "claude.bat", "claude")
 
@@ -72,9 +74,10 @@ def discover_claude_candidates(preferred_path: str = "") -> list[str]:
 
 
 def resolve_claude_executable(preferred_path: str = "") -> str:
-    for candidate in discover_claude_candidates(preferred_path):
-        if Path(candidate).exists():
-            return str(Path(candidate))
+    for candidate in sorted(discover_claude_candidates(preferred_path), key=windows_executable_rank):
+        resolved = resolve_windows_executable_shim(candidate)
+        if Path(resolved).exists():
+            return str(Path(resolved))
 
     raise FileNotFoundError(
         "未找到可用的 Claude Code CLI。请先安装 @anthropic-ai/claude-code，"

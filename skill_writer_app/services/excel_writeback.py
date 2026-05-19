@@ -11,6 +11,7 @@ from queue import Queue
 from typing import Callable, List
 
 from skill_writer_app.services.process_command import normalize_windows_script_command, windows_subprocess_kwargs
+from skill_writer_app.services.python_dependency_service import PythonDependencyService
 from skill_writer_app.services.text_decode import decode_process_output
 
 
@@ -21,6 +22,7 @@ class ExcelWritebackService:
         self.last_error_message: str = ""
         self.last_summary_lines: list[str] = []
         self.last_verify_lines: list[str] = []
+        self.dependency_service = PythonDependencyService()
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -122,6 +124,17 @@ class ExcelWritebackService:
             return_code = -1
             try:
                 log_queue.put("[writeback-python] " + resolved_python)
+                log_queue.put("[writeback-mode] local-only; no model call")
+                dependency_result = self.dependency_service.ensure_runtime_dependencies(
+                    resolved_python,
+                    log_queue,
+                    install_optional=False,
+                )
+                log_queue.put("[python-deps] " + dependency_result.summary())
+                if not dependency_result.ok:
+                    self.last_error_message = "Python dependency install failed: " + dependency_result.summary()
+                    return_code = 1
+                    return
                 run_command = normalize_windows_script_command(command)
                 log_queue.put("[writeback-cmd] " + subprocess.list2cmdline(run_command))
                 self.process = subprocess.Popen(

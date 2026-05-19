@@ -198,7 +198,17 @@ def parse_args() -> argparse.Namespace:
         default="openpyxl",
         help="Excel write engine. openpyxl is much faster; excel keeps the old COM path.",
     )
+    parser.add_argument(
+        "--reorder",
+        choices=("never", "auto"),
+        default="never",
+        help="Move inserted payload rows near existing id groups. This can be slow on large workbooks.",
+    )
     return parser.parse_args()
+
+
+def emit(message: str) -> None:
+    print(message, flush=True)
 
 
 def load_payload(path: Path) -> Dict[str, Any]:
@@ -312,6 +322,7 @@ def maybe_copy_targets(targets: Dict[str, Path], copy_to: str | None) -> Dict[st
         if dst.exists():
             suffix = time.strftime("%Y%m%d_%H%M%S")
             dst = out_dir / f"{src.stem}_{suffix}{src.suffix}"
+        emit(f"[writeback-progress] copy {key}: {src} -> {dst}")
         shutil.copy2(src, dst)
         copied[key] = dst
     return copied
@@ -323,6 +334,7 @@ def maybe_backup_targets(targets: Dict[str, Path], backup_dir: str | None, dry_r
     out_dir = Path(backup_dir).expanduser().resolve() / now_tag()
     out_dir.mkdir(parents=True, exist_ok=True)
     for src in targets.values():
+        emit(f"[writeback-progress] backup: {src} -> {out_dir / src.name}")
         shutil.copy2(src, out_dir / src.name)
 
 
@@ -1329,6 +1341,37 @@ def verify_payload_rows_openpyxl(
     return results
 
 
+def verify_payload_rows_openpyxl_workbooks(
+    workbooks: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> List[str]:
+    results: List[str] = []
+    for sheet_name, rows in payload["rows"].items():
+        if not rows:
+            continue
+        schema = SHEET_SCHEMAS[sheet_name]
+        ws = workbooks[schema["workbook_key"]][schema["sheet_name"]]
+        key_col = schema["unique_column"]
+        expected = {str(get_unique_value(sheet_name, normalize_row(sheet_name, row))) for row in rows}
+        found: Set[str] = set()
+        for row_idx in range(schema["data_start_row"], ws.max_row + 1):
+            value = str(ws.cell(row_idx, key_col).value or "")
+            if value in expected:
+                found.add(value)
+                if len(found) == len(expected):
+                    break
+        missing = sorted(expected - found)
+        if missing:
+            results.append(f"[verify-error] {sheet_name}: missing_keys={missing[:10]}")
+        else:
+            results.append(f"[verify] {sheet_name}: ok keys={len(expected)}")
+    return results
+
+
+def logs_have_insert(logs: Iterable[str]) -> bool:
+    return any(": insert " in log for log in logs)
+
+
 def write_sheet_rows(
     ws: Any,
     sheet_name: str,
@@ -1396,6 +1439,7 @@ def open_workbook(excel: Any, path: Path, read_only: bool) -> Any:
 
 
 def run_with_openpyxl(args: argparse.Namespace) -> int:
+    emit("[writeback-progress] local-only openpyxl writeback started")
     payload_path = Path(args.payload).expanduser().resolve()
     payload = load_payload(payload_path)
     payload = expand_payload_rows(payload)
@@ -1408,10 +1452,12 @@ def run_with_openpyxl(args: argparse.Namespace) -> int:
     write_targets = maybe_copy_targets(targets, args.copy_to)
     maybe_backup_targets(write_targets, args.backup_dir, args.dry_run)
     timings.append(("prepare_targets", time.perf_counter() - phase_started_at))
+    emit(f"[writeback-progress] prepare_targets done in {timings[-1][1]:.2f}s")
 
     workbooks: Dict[str, Any] = {}
     touched: Dict[str, bool] = {key: False for key in write_targets}
     all_logs: List[str] = []
+    verify_lines: List[str] = []
 
     if args.dry_run:
         all_logs = dry_run_with_xlsx_xml(payload, write_targets, args.dedupe_existing, timings)
@@ -1421,6 +1467,7 @@ def run_with_openpyxl(args: argparse.Namespace) -> int:
         print("dry_run:", args.dry_run)
         print("dedupe_existing:", args.dedupe_existing)
         print("engine:", args.engine)
+        print("reorder:", args.reorder)
         print("scan_mode: xlsx_xml")
         for key, path in write_targets.items():
             print(f"{key}: {path}")
@@ -1437,6 +1484,7 @@ def run_with_openpyxl(args: argparse.Namespace) -> int:
     try:
         for workbook_key, workbook_path in write_targets.items():
             phase_started_at = time.perf_counter()
+            emit(f"[writeback-progress] opening {workbook_key}: {workbook_path}")
             workbooks[workbook_key] = load_workbook(
                 workbook_path,
                 read_only=args.dry_run,
@@ -1444,6 +1492,7 @@ def run_with_openpyxl(args: argparse.Namespace) -> int:
                 keep_links=False,
             )
             timings.append((f"open_{workbook_key}", time.perf_counter() - phase_started_at))
+            emit(f"[writeback-progress] opened {workbook_key} in {timings[-1][1]:.2f}s")
 
         for sheet_name, rows in payload["rows"].items():
             if sheet_name not in SHEET_SCHEMAS:
@@ -1453,21 +1502,31 @@ def run_with_openpyxl(args: argparse.Namespace) -> int:
             schema = SHEET_SCHEMAS[sheet_name]
             workbook_key = schema["workbook_key"]
             phase_started_at = time.perf_counter()
+            emit(f"[writeback-progress] writing sheet {sheet_name} rows={len(rows)}")
             ws = workbooks[workbook_key][schema["sheet_name"]]
             logs = write_sheet_rows_openpyxl(ws, sheet_name, rows, args.dry_run, args.dedupe_existing)
-            if not args.dry_run:
+            if not args.dry_run and args.reorder == "auto" and logs_have_insert(logs):
+                emit(f"[writeback-progress] reordering sheet {sheet_name}")
                 logs.extend(reorder_payload_rows_openpyxl(ws, sheet_name, rows))
             timings.append((f"sheet_{sheet_name}", time.perf_counter() - phase_started_at))
+            emit(f"[writeback-progress] sheet {sheet_name} done in {timings[-1][1]:.2f}s")
             all_logs.extend(logs)
             if logs:
                 touched[workbook_key] = True
 
         if not args.dry_run:
+            phase_started_at = time.perf_counter()
+            emit("[writeback-progress] verifying written rows in memory")
+            verify_lines = verify_payload_rows_openpyxl_workbooks(workbooks, payload)
+            timings.append(("verify_in_memory", time.perf_counter() - phase_started_at))
+            emit(f"[writeback-progress] verify_in_memory done in {timings[-1][1]:.2f}s")
             for workbook_key, wb in workbooks.items():
                 phase_started_at = time.perf_counter()
                 if touched[workbook_key]:
+                    emit(f"[writeback-progress] saving {workbook_key}: {write_targets[workbook_key]}")
                     wb.save(write_targets[workbook_key])
                 timings.append((f"save_{workbook_key}", time.perf_counter() - phase_started_at))
+                emit(f"[writeback-progress] save {workbook_key} done in {timings[-1][1]:.2f}s")
     finally:
         for wb in workbooks.values():
             close = getattr(wb, "close", None)
@@ -1480,13 +1539,13 @@ def run_with_openpyxl(args: argparse.Namespace) -> int:
     print("dry_run:", args.dry_run)
     print("dedupe_existing:", args.dedupe_existing)
     print("engine:", args.engine)
+    print("reorder:", args.reorder)
     for key, path in write_targets.items():
         print(f"{key}: {path}")
     for log in all_logs:
         print(log)
     for line in summarize_logs(all_logs):
         print(line)
-    verify_lines = verify_payload_rows_openpyxl(write_targets, payload)
     for line in verify_lines:
         print(line)
     for label, seconds in timings:

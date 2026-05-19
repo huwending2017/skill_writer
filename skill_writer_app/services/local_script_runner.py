@@ -10,6 +10,7 @@ from queue import Queue
 from typing import Callable, List, Sequence
 
 from skill_writer_app.services.process_command import normalize_windows_script_command, windows_subprocess_kwargs
+from skill_writer_app.services.python_dependency_service import PythonDependencyService
 from skill_writer_app.services.text_decode import decode_process_output
 
 
@@ -17,6 +18,7 @@ class LocalScriptRunner:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
         self.last_error_message: str = ""
+        self.dependency_service = PythonDependencyService()
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
@@ -95,6 +97,17 @@ class LocalScriptRunner:
             return_code = -1
             try:
                 log_queue.put("[local-python] " + resolved_python)
+                dependency_result = self.dependency_service.ensure_runtime_dependencies(
+                    resolved_python,
+                    log_queue,
+                    install_optional=True,
+                    fail_on_required=False,
+                )
+                log_queue.put("[python-deps] " + dependency_result.summary())
+                if not dependency_result.ok:
+                    self.last_error_message = "Python dependency install failed: " + dependency_result.summary()
+                    return_code = 1
+                    return
                 log_queue.put("[local-script] " + str(resolved_script))
                 run_command = normalize_windows_script_command(command)
                 log_queue.put("[local-cmd] " + subprocess.list2cmdline(run_command))
