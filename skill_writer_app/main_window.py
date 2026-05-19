@@ -7,6 +7,7 @@ import queue
 import re
 import shutil
 import subprocess
+import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -196,6 +197,7 @@ class SkillWriterApp:
         self.serial_pending_steps: list[str] = []
         self.step_overview_visible: bool = False
         self.workbench_advanced_visible: bool = False
+        self.environment_check_running: bool = False
         self.current_task_started_at: datetime | None = None
         self.current_active_task_key: str = ""
         self.last_log_at: datetime | None = None
@@ -1480,25 +1482,49 @@ class SkillWriterApp:
         self.health_text.configure(state="disabled")
 
     def run_environment_check(self) -> None:
+        if self.environment_check_running:
+            return
+        self.environment_check_running = True
+        self.environment_health_var.set("环境体检：检查中...")
+
         workspace_root = self.workspace_var.get().strip()
         battle_root = self.battle_root_var.get().strip()
-        items = [
-            self.environment_check_service.check_python(self.python_executable_var.get().strip()),
-            self.environment_check_service.check_command("Codex CLI", self.codex_executable_var.get().strip() or "codex", ["--version"]),
-            self.environment_check_service.check_command("Claude CLI", self.claude_executable_var.get().strip() or "claude", ["--version"]),
-            self.environment_check_service.check_path("工作区", workspace_root, must_be_dir=True),
-            self.environment_check_service.check_path("battle_root", battle_root, must_be_dir=True),
-            self.environment_check_service.check_path("技能 Excel", self.skill_excel_var.get().strip(), must_be_file=True),
-            self.environment_check_service.check_path("战报 Excel", self.war_excel_var.get().strip(), must_be_file=True),
-        ]
-        if battle_root and Path(battle_root).exists():
-            items.append(self.environment_check_service.check_write_access("battle 临时目录写权限", str(Path(battle_root) / "temp_skill_workspace")))
-        failed = [item for item in items if not item.ok]
-        self.environment_health_var.set(f"环境体检：{len(items) - len(failed)}/{len(items)} 项通过")
-        rendered = self.environment_check_service.render(items)
+        python_executable = self.python_executable_var.get().strip()
+        codex_executable = self.codex_executable_var.get().strip() or "codex"
+        claude_executable = self.claude_executable_var.get().strip() or "claude"
+        skill_excel = self.skill_excel_var.get().strip()
+        war_excel = self.war_excel_var.get().strip()
+
+        def worker() -> None:
+            items = [
+                self.environment_check_service.check_python(python_executable),
+                self.environment_check_service.check_command("Codex CLI", codex_executable, ["--version"]),
+                self.environment_check_service.check_command("Claude CLI", claude_executable, ["--version"]),
+                self.environment_check_service.check_path("工作区", workspace_root, must_be_dir=True),
+                self.environment_check_service.check_path("battle_root", battle_root, must_be_dir=True),
+                self.environment_check_service.check_path("技能 Excel", skill_excel, must_be_file=True),
+                self.environment_check_service.check_path("战报 Excel", war_excel, must_be_file=True),
+            ]
+            if battle_root and Path(battle_root).exists():
+                items.append(
+                    self.environment_check_service.check_write_access(
+                        "battle 临时目录写权限",
+                        str(Path(battle_root) / "temp_skill_workspace"),
+                    )
+                )
+            failed = [item for item in items if not item.ok]
+            summary = f"环境体检：{len(items) - len(failed)}/{len(items)} 项通过"
+            rendered = self.environment_check_service.render(items)
+            self.root.after(0, lambda: self.finish_environment_check(summary, rendered))
+
+        threading.Thread(target=worker, name="skill-writer-env-check", daemon=True).start()
+
+    def finish_environment_check(self, summary: str, rendered: str) -> None:
+        self.environment_check_running = False
+        self.environment_health_var.set(summary)
         current = self.task_health_snapshot()
         self.set_health_text(rendered + ("\n\n" + current if current else ""))
-        self.append_log("[health] " + self.environment_health_var.get())
+        self.append_log("[health] " + summary)
 
     def task_health_snapshot(self) -> str:
         task_dir = self.latest_task_dir_var.get().strip()

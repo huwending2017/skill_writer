@@ -28,6 +28,18 @@ class ProfileShortcut:
 
 MODEL_PRESETS: List[ModelPreset] = [
     ModelPreset(
+        key="openai_gpt55",
+        label="OpenAI GPT-5.5",
+        vendor="OpenAI",
+        model_name="gpt-5.5",
+        preset_args=(),
+        release_date="N/A",
+        source_url="https://platform.openai.com/docs/models",
+        summary="OpenAI 高质量模型预设。用于技能机制复杂、需要更强推理或最终收口的场景。",
+        support_note="仅在当前 Codex 后端/账号/API key 支持 gpt-5.5 时可用；如果 CLI 返回 unsupported model，请切回 GPT-5.4 或 GPT-5.3-Codex。",
+        recommended_for="复杂技能机制、跨技能联动、最终质量收口",
+    ),
+    ModelPreset(
         key="openai_gpt54",
         label="OpenAI GPT-5.4",
         vendor="OpenAI",
