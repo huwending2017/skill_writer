@@ -169,6 +169,7 @@ class SkillWriterApp:
         self.preview_button: ttk.Button
         self.copy_button: ttk.Button
         self.real_button: ttk.Button
+        self.quick_real_button: ttk.Button
         self.stop_button: ttk.Button
         self.next_step_button: ttk.Button
         self.serial_button: ttk.Button
@@ -435,6 +436,14 @@ class SkillWriterApp:
             command=self.toggle_step_overview,
         )
         self.step_overview_button.pack(side="left", padx=6)
+        self.quick_real_button = ttk.Button(utility_row, text="写正式表", command=self.write_excel_real)
+        self.quick_real_button.pack(side="left", padx=6)
+        ttk.Checkbutton(
+            utility_row,
+            text="串行包含正式",
+            variable=self.serial_include_real_var,
+            command=self.update_action_buttons,
+        ).pack(side="left", padx=6)
         ttk.Button(utility_row, text="打开输出", command=self.open_output_file).pack(side="left", padx=6)
         ttk.Button(utility_row, text="环境体检", command=self.run_environment_check).pack(side="left", padx=6)
 
@@ -2624,25 +2633,33 @@ class SkillWriterApp:
 
     def has_excel_copy_outputs(self) -> bool:
         copy_dir_value = self.copy_dir_var.get().strip()
-        if not copy_dir_value:
-            return False
-
-        copy_dir = Path(copy_dir_value)
+        if copy_dir_value:
+            copy_dir = Path(copy_dir_value)
+        else:
+            task_dir_value = self.latest_task_dir_var.get().strip()
+            copy_dir = Path(task_dir_value) / "excel_test_copy" if task_dir_value else Path()
         if not copy_dir.exists() or not copy_dir.is_dir():
             return False
 
         workbook_values = [self.skill_excel_var.get().strip(), self.war_excel_var.get().strip()]
         workbook_names = [Path(value).name for value in workbook_values if value and Path(value).name]
+        xlsx_outputs = [
+            path
+            for path in copy_dir.glob("*.xlsx")
+            if path.is_file() and not path.name.startswith("~$")
+        ]
         if not workbook_names:
-            return False
+            return bool(xlsx_outputs)
 
         for name in workbook_names:
             if not any(path.is_file() for path in copy_dir.glob(name)):
                 stem = Path(name).stem
                 suffix = Path(name).suffix
-                if not any(path.is_file() for path in copy_dir.glob(f"{stem}_*{suffix}")):
-                    return False
-        return True
+                if any(path.is_file() for path in copy_dir.glob(f"{stem}_*{suffix}")):
+                    return True
+            else:
+                return True
+        return bool(xlsx_outputs)
 
     def build_workflow_state(self) -> dict[str, object]:
         task_dir = self.normalize_path(self.latest_task_dir_var.get())
@@ -2944,6 +2961,7 @@ class SkillWriterApp:
         self.real_button.configure(
             state="normal" if (not state["busy"] and current_step == "real" and state["can_real"]) else "disabled"
         )
+        self.quick_real_button.configure(state="normal" if (not state["busy"] and state["can_real"]) else "disabled")
         self.stop_button.configure(state="normal" if state["busy"] else "disabled")
         self.serial_button.configure(
             state="normal" if (not state["busy"] and bool(state["recommended"])) else "disabled"
