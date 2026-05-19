@@ -12,6 +12,7 @@ from queue import Queue
 from typing import Callable, List, Optional, Sequence
 
 from skill_writer_app.services.codex_locator import resolve_codex_executable
+from skill_writer_app.services.process_command import normalize_windows_script_command, windows_subprocess_kwargs
 from skill_writer_app.services.text_decode import decode_process_output
 
 
@@ -37,15 +38,7 @@ class CodexRunner:
         self.last_resolved_executable: str = ""
 
     def _windows_subprocess_kwargs(self) -> dict:
-        if os.name != "nt":
-            return {}
-
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        return {
-            "creationflags": subprocess.CREATE_NO_WINDOW,
-            "startupinfo": startupinfo,
-        }
+        return windows_subprocess_kwargs()
 
     def _subprocess_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -285,9 +278,10 @@ class CodexRunner:
             try:
                 Path(output_file).parent.mkdir(parents=True, exist_ok=True)
                 log_queue.put("[codex-cli] " + self.last_resolved_executable)
-                log_queue.put("[codex-cmd] " + subprocess.list2cmdline(command))
+                run_command = normalize_windows_script_command(command)
+                log_queue.put("[codex-cmd] " + subprocess.list2cmdline(run_command))
                 self.process = subprocess.Popen(
-                    command,
+                    run_command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

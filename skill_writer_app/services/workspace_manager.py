@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -79,6 +80,41 @@ class WorkspaceManager:
         if not temp_root:
             return ""
         return str(self.global_workspace_dir(temp_root) / folder_name)
+
+    def safe_task_dir_name(self, name: str, fallback: str = "skill_task") -> str:
+        value = name.strip().lower()
+        value = re.sub(r"[^0-9a-zA-Z_\-\u4e00-\u9fff]+", "_", value)
+        value = re.sub(r"_+", "_", value).strip("._- ")
+        return value[:64] or fallback
+
+    def create_named_task_dir(self, workspace_root: str, name: str) -> Optional[Path]:
+        temp_root = self.temp_workspace_path(workspace_root)
+        if not temp_root:
+            return None
+        temp_root.mkdir(parents=True, exist_ok=True)
+        base_name = self.safe_task_dir_name(name)
+        candidate = temp_root / base_name
+        if candidate.exists():
+            index = 2
+            while (temp_root / f"{base_name}_{index}").exists():
+                index += 1
+            candidate = temp_root / f"{base_name}_{index}"
+        candidate.mkdir(parents=True, exist_ok=True)
+        self.ensure_task_layout(candidate, migrate_legacy=False)
+        return candidate
+
+    def task_dir_for_payload(self, payload_path: str | Path) -> Path:
+        parent = Path(payload_path).expanduser().parent
+        if parent.name == "config":
+            return parent.parent
+        return parent
+
+    def task_local_dir(self, task_dir: str | Path, folder_name: str) -> Path:
+        root = Path(task_dir)
+        self.ensure_task_layout(root, migrate_legacy=False)
+        target = root / folder_name
+        target.mkdir(parents=True, exist_ok=True)
+        return target
 
     def global_workspace_dir(self, temp_root: Path) -> Path:
         return temp_root / self.GLOBAL_DIR_NAME

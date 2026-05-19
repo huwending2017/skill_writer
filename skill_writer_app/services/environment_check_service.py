@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from skill_writer_app.services.process_command import normalize_windows_script_command, windows_subprocess_kwargs
+
 
 @dataclass
 class CheckItem:
@@ -16,12 +18,13 @@ class CheckItem:
 
 
 class EnvironmentCheckService:
-    def _hidden_subprocess_kwargs(self) -> dict:
-        if os.name != "nt":
-            return {}
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": startupinfo}
+    def _is_current_app_executable(self, executable: str) -> bool:
+        if not getattr(sys, "frozen", False):
+            return False
+        try:
+            return Path(executable).resolve() == Path(sys.executable).resolve()
+        except Exception:
+            return False
 
     def check_command(self, label: str, command: str, version_args: list[str] | None = None) -> CheckItem:
         command = command.strip()
@@ -36,7 +39,9 @@ class EnvironmentCheckService:
             resolved = shutil.which(command or label.lower()) or ""
         if not resolved:
             return CheckItem(label, False, "未找到可执行文件")
-        args = [resolved, *(version_args or ["--version"])]
+        if self._is_current_app_executable(resolved):
+            return CheckItem(label, False, "已拦截：不能把 SkillWriterDesktop.exe 当作外部 CLI 执行")
+        args = normalize_windows_script_command([resolved, *(version_args or ["--version"])])
         try:
             proc = subprocess.run(
                 args,
@@ -44,7 +49,7 @@ class EnvironmentCheckService:
                 stderr=subprocess.STDOUT,
                 timeout=8,
                 env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
-                **self._hidden_subprocess_kwargs(),
+                **windows_subprocess_kwargs(),
             )
             output = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()
             detail = output[0] if output else resolved
@@ -76,7 +81,11 @@ class EnvironmentCheckService:
             return CheckItem(label, False, str(exc))
 
     def check_python(self, executable: str) -> CheckItem:
-        command = executable.strip() or sys.executable
+        command = executable.strip()
+        if not command:
+            command = shutil.which("python") or shutil.which("py") or ""
+        if not command:
+            return CheckItem("Python", False, "未找到 python；请在工具里配置本机 Python 路径")
         return self.check_command("Python", command, ["--version"])
 
     def render(self, items: list[CheckItem]) -> str:

@@ -9,6 +9,7 @@ from pathlib import Path
 from queue import Queue
 from typing import Callable, List, Sequence
 
+from skill_writer_app.services.process_command import normalize_windows_script_command, windows_subprocess_kwargs
 from skill_writer_app.services.text_decode import decode_process_output
 
 
@@ -37,15 +38,7 @@ class LocalScriptRunner:
         return True
 
     def _windows_subprocess_kwargs(self) -> dict:
-        if os.name != "nt":
-            return {}
-
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        return {
-            "creationflags": subprocess.CREATE_NO_WINDOW,
-            "startupinfo": startupinfo,
-        }
+        return windows_subprocess_kwargs()
 
     def _subprocess_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -103,9 +96,10 @@ class LocalScriptRunner:
             try:
                 log_queue.put("[local-python] " + resolved_python)
                 log_queue.put("[local-script] " + str(resolved_script))
-                log_queue.put("[local-cmd] " + subprocess.list2cmdline(command))
+                run_command = normalize_windows_script_command(command)
+                log_queue.put("[local-cmd] " + subprocess.list2cmdline(run_command))
                 self.process = subprocess.Popen(
-                    command,
+                    run_command,
                     cwd=workdir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

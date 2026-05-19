@@ -11,7 +11,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from skill_writer_app.model_catalog import (
     MODEL_PRESETS,
@@ -198,6 +198,9 @@ class SkillWriterApp:
         self.step_overview_visible: bool = False
         self.workbench_advanced_visible: bool = False
         self.environment_check_running: bool = False
+        self.accepted_workflow_prompt_hash: str = ""
+        self.workflow_refresh_after_id: str | None = None
+        self.suppress_requirement_change: bool = False
         self.current_task_started_at: datetime | None = None
         self.current_active_task_key: str = ""
         self.last_log_at: datetime | None = None
@@ -375,14 +378,15 @@ class SkillWriterApp:
             width=20,
         )
         template_box.pack(side="left", padx=6)
-        template_box.bind("<<ComboboxSelected>>", lambda _: self.refresh_prompt())
+        template_box.bind("<<ComboboxSelected>>", self.on_requirement_text_changed)
         ttk.Button(input_bar, text="生成 Prompt", command=self.refresh_prompt).pack(side="left", padx=6)
         ttk.Button(input_bar, text="复制 Prompt", command=self.copy_prompt).pack(side="left", padx=6)
+        ttk.Button(input_bar, text="新建技能任务", command=self.confirm_new_skill_development).pack(side="left", padx=6)
         ttk.Label(input_bar, textvariable=self.template_hint_var).pack(side="left", padx=12)
 
         self.description_text = tk.Text(input_frame, height=7, wrap="word")
         self.description_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
-        self.description_text.bind("<KeyRelease>", lambda _: self.refresh_prompt())
+        self.description_text.bind("<KeyRelease>", self.on_requirement_text_changed)
 
         ttk.Label(input_frame, text="生成后的 Prompt").grid(row=2, column=0, sticky="w", padx=6)
         self.prompt_text = tk.Text(input_frame, height=8, wrap="word")
@@ -892,7 +896,8 @@ class SkillWriterApp:
             width=18,
         )
         template_box.pack(side="left", padx=8)
-        template_box.bind("<<ComboboxSelected>>", lambda _: self.refresh_prompt())
+        template_box.bind("<<ComboboxSelected>>", self.on_requirement_text_changed)
+        ttk.Button(top, text="新建技能任务", command=self.confirm_new_skill_development).pack(side="left", padx=8)
         ttk.Label(top, textvariable=self.template_hint_var).pack(side="left")
 
         ttk.Label(frame, text="技能描述").grid(row=1, column=0, sticky="w")
@@ -900,7 +905,7 @@ class SkillWriterApp:
 
         self.description_text = tk.Text(frame, wrap="word")
         self.description_text.grid(row=2, column=0, sticky="nsew", padx=(0, 6))
-        self.description_text.bind("<KeyRelease>", lambda _: self.refresh_prompt())
+        self.description_text.bind("<KeyRelease>", self.on_requirement_text_changed)
 
         right = ttk.Frame(frame)
         right.grid(row=2, column=1, sticky="nsew", padx=(6, 0))
@@ -1284,6 +1289,7 @@ class SkillWriterApp:
         self.constraints_text.insert("1.0", self.settings.additional_constraints)
         self.prompt_text.insert("1.0", self.settings.last_prompt or TEMPLATE_TEXT[self.current_template_key()])
         self.refresh_prompt()
+        self.accept_current_requirement_context()
 
     def resolve_initial_config_dir(self) -> str:
         if self.settings.config_dir:
@@ -1616,6 +1622,9 @@ class SkillWriterApp:
         if not self.workspace_manager.belongs_to_temp_workspace(self.payload_var.get().strip(), workspace_root):
             self.payload_var.set(self.workspace_manager.default_payload_path(workspace_root))
 
+        if self.latest_task_dir_var.get().strip():
+            self.set_task_local_excel_dirs(self.latest_task_dir_var.get().strip())
+
         default_copy_dir = self.workspace_manager.default_temp_copy_dir(workspace_root, "excel_test_copy")
         if (
             not self.workspace_manager.belongs_to_temp_workspace(self.copy_dir_var.get().strip(), workspace_root)
@@ -1629,6 +1638,15 @@ class SkillWriterApp:
             or self.backup_dir_var.get().strip().endswith(r"\temp_skill_workspace\excel_backup")
         ):
             self.backup_dir_var.set(default_backup_dir)
+
+    def set_task_local_excel_dirs(self, task_dir: str) -> None:
+        if not task_dir:
+            return
+        path = Path(task_dir)
+        if not path.exists() or not path.is_dir():
+            return
+        self.copy_dir_var.set(str(self.workspace_manager.task_local_dir(path, "excel_test_copy")))
+        self.backup_dir_var.set(str(self.workspace_manager.task_local_dir(path, "excel_backup")))
 
     def clear_recent_lists(self) -> None:
         self.recent_payloads = []
@@ -1660,7 +1678,7 @@ class SkillWriterApp:
 
         if force_latest and self.recent_payloads:
             selected_payload = str(self.recent_payloads[0])
-            payload_parent = self.recent_payloads[0].parent
+            payload_parent = self.workspace_manager.task_dir_for_payload(self.recent_payloads[0])
             if payload_parent.exists() and payload_parent.is_dir():
                 selected_task_dir = str(payload_parent)
 
@@ -1668,7 +1686,7 @@ class SkillWriterApp:
             if (not force_latest) and current_task_dir and Path(current_task_dir).exists():
                 selected_task_dir = current_task_dir
             elif (not force_latest) and current_payload and Path(current_payload).exists():
-                payload_parent = Path(current_payload).parent
+                payload_parent = self.workspace_manager.task_dir_for_payload(current_payload)
                 temp_root = self.workspace_manager.temp_workspace_path(workspace_root)
                 if temp_root and payload_parent != temp_root:
                     selected_task_dir = str(payload_parent)
@@ -1701,6 +1719,8 @@ class SkillWriterApp:
             self.payload_var.set(self.workspace_manager.default_payload_path(workspace_root))
             self.fill_payload_listbox("")
 
+        if selected_task_dir:
+            self.set_task_local_excel_dirs(selected_task_dir)
         self.refresh_current_task_artifacts()
         self.update_action_buttons()
 
@@ -1774,10 +1794,11 @@ class SkillWriterApp:
         self.payload_var.set(normalized_payload)
 
         if normalized_payload and self.path_belongs_to_current_temp_workspace(normalized_payload):
-            payload_parent = Path(normalized_payload).parent
+            payload_parent = self.workspace_manager.task_dir_for_payload(normalized_payload)
             temp_root = self.workspace_manager.temp_workspace_path(self.workspace_var.get().strip())
             if temp_root and payload_parent != temp_root:
                 self.latest_task_dir_var.set(str(payload_parent))
+                self.set_task_local_excel_dirs(str(payload_parent))
             else:
                 self.latest_task_dir_var.set("")
 
@@ -1787,6 +1808,7 @@ class SkillWriterApp:
     def sync_task_dir_selection(self, task_dir: str) -> None:
         normalized_task_dir = self.normalize_path(task_dir)
         self.latest_task_dir_var.set(normalized_task_dir)
+        self.set_task_local_excel_dirs(normalized_task_dir)
 
         preferred_payload = self.workspace_manager.find_primary_payload_for_dir(normalized_task_dir)
         if preferred_payload:
@@ -1830,7 +1852,7 @@ class SkillWriterApp:
         if payload and not self.path_belongs_to_current_temp_workspace(payload):
             return "当前 payload 不属于当前 battle_root，请刷新列表或重新选择。"
         if task_dir and payload:
-            payload_parent = self.normalize_path(str(Path(payload).parent))
+            payload_parent = self.normalize_path(str(self.workspace_manager.task_dir_for_payload(payload)))
             if payload_parent != task_dir:
                 return "当前 payload 不属于当前任务目录，请重新选择任务目录或点击“自动发现”。"
         return ""
@@ -1856,7 +1878,94 @@ class SkillWriterApp:
         value = prompt if prompt else self.prompt_text.get("1.0", "end").strip()
         return hashlib.sha1(value.encode("utf-8", errors="replace")).hexdigest()
 
+    def current_prompt_hash(self) -> str:
+        return self.prompt_hash(self.prompt_text.get("1.0", "end").strip())
+
+    def accept_current_requirement_context(self) -> None:
+        if hasattr(self, "prompt_text"):
+            self.accepted_workflow_prompt_hash = self.current_prompt_hash()
+
+    def has_requirement_changed(self) -> bool:
+        if self.suppress_requirement_change or not self.accepted_workflow_prompt_hash:
+            return False
+        return self.current_prompt_hash() != self.accepted_workflow_prompt_hash
+
+    def on_requirement_text_changed(self, _event: object | None = None) -> None:
+        self.refresh_prompt()
+        if self.suppress_requirement_change:
+            return
+        if self.workflow_refresh_after_id:
+            self.root.after_cancel(self.workflow_refresh_after_id)
+        self.workflow_refresh_after_id = self.root.after(150, self.on_requirement_refresh_due)
+
+    def on_requirement_refresh_due(self) -> None:
+        self.workflow_refresh_after_id = None
+        if self.has_requirement_changed():
+            self.stop_serial_workflow("检测到技能描述变更，已停止沿用旧流程状态。")
+        self.update_action_buttons()
+        self.update_task_health_panel()
+
+    def detach_old_artifacts_for_new_requirement(self) -> None:
+        if not self.has_requirement_changed():
+            return
+        self.reset_current_task_selection_for_new_requirement()
+
+    def reset_current_task_selection_for_new_requirement(self) -> None:
+        workspace_root = self.workspace_var.get().strip()
+        self.latest_task_dir_var.set("")
+        if workspace_root:
+            self.payload_var.set(self.workspace_manager.default_payload_path(workspace_root))
+        else:
+            self.payload_var.set("")
+        self.current_task_artifacts = []
+        if hasattr(self, "artifact_listbox"):
+            self.artifact_listbox.delete(0, "end")
+        self.artifact_summary_var.set("检测到新需求：已脱离旧任务产物，下一步会创建新的任务目录。")
+
+    def default_new_task_name(self) -> str:
+        title = self.extract_skill_title(self.get_text(self.description_text) if hasattr(self, "description_text") else "")
+        return self.workspace_manager.safe_task_dir_name(title, "skill_task")
+
+    def confirm_new_skill_development(self) -> None:
+        if self.is_task_running():
+            messagebox.showwarning("提示", "当前已有任务在执行，请等待完成或停止后再确认新技能开发。")
+            return
+        self.refresh_prompt()
+        if not self.get_text(self.description_text):
+            messagebox.showwarning("提示", "请先填写技能描述。")
+            return
+
+        old_target = self.current_target_key()
+        if old_target:
+            self.workflow_state_service.clear(old_target)
+        task_name = simpledialog.askstring(
+            "新建技能任务",
+            "给这次技能开发起一个任务名：",
+            initialvalue=self.default_new_task_name(),
+            parent=self.root,
+        )
+        if task_name is None:
+            return
+        task_dir = self.workspace_manager.create_named_task_dir(self.workspace_var.get().strip(), task_name)
+        if not task_dir:
+            messagebox.showerror("错误", "当前工作目录下未识别到 battle_root，无法创建任务目录。")
+            return
+        self.stop_serial_workflow("已确认新的技能开发，旧流程状态不再沿用。")
+        self.latest_task_dir_var.set(str(task_dir))
+        self.payload_var.set(str(self.workspace_manager.canonical_task_file(task_dir, "temp_excel_payload.json")))
+        self.set_task_local_excel_dirs(str(task_dir))
+        self.refresh_current_task_artifacts()
+        self.accept_current_requirement_context()
+        self.status_var.set("已确认新技能开发")
+        self.set_task_stage("等待开发")
+        self.append_log(f"[workflow] 已新建技能任务：{task_dir}")
+        self.update_action_buttons()
+        self.update_task_health_panel()
+
     def develop_resume_key(self, prompt: str = "") -> str:
+        if self.has_requirement_changed():
+            workspace_root = self.normalize_path(self.workspace_var.get())
+            return f"{workspace_root}::develop::{self.prompt_hash(prompt)}"
         target_key = self.current_target_key()
         if target_key:
             return target_key
@@ -1865,7 +1974,7 @@ class SkillWriterApp:
 
     def active_task_target_keys(self, prompt: str = "") -> list[str]:
         keys = []
-        current = self.current_target_key()
+        current = "" if self.has_requirement_changed() else self.current_target_key()
         if current:
             keys.append(current)
         fallback = self.develop_resume_key(prompt)
@@ -1903,6 +2012,21 @@ class SkillWriterApp:
             f"上次 payload: {payload or '未识别'}\n\n"
             f"{context_block}\n\n"
             "原始需求如下：\n"
+            f"{original_prompt}"
+        )
+
+    def build_named_task_develop_prompt(self, original_prompt: str) -> str:
+        task_dir = self.latest_task_dir_var.get().strip()
+        payload = self.payload_var.get().strip()
+        if not task_dir:
+            return original_prompt
+        return (
+            "本次是工具中已确认命名的一轮技能开发，请严格使用下面这个任务目录作为本次所有临时产物的管理目录。\n"
+            "不要把本次产物写到其他旧任务目录，也不要复用其他技能任务的 payload、临时 Excel、测试文件或 repair 目录。\n"
+            f"本次任务目录: {task_dir}\n"
+            f"本次 payload: {payload or '请写到任务目录/config/temp_excel_payload.json'}\n"
+            "本次目录结构约定: config/ 放 payload 和临时配置；scripts/ 放临时 Lua/辅助脚本；tests/ 放测试；docs/ 放实现说明；"
+            "excel_test_copy/ 放本次 Excel 副本；excel_backup/ 放本次正式回写备份。\n\n"
             f"{original_prompt}"
         )
 
@@ -2253,6 +2377,8 @@ class SkillWriterApp:
             "copy": False,
             "real": False,
         }
+        if self.has_requirement_changed():
+            return flags
 
         matching_entries = [entry for entry in self.history_entries if self.history_matches_current_target(entry, task_dir, payload)]
         handoff_state = self.task_handoff_service.load_state(task_dir)
@@ -2397,6 +2523,7 @@ class SkillWriterApp:
     def build_workflow_state(self) -> dict[str, object]:
         task_dir = self.normalize_path(self.latest_task_dir_var.get())
         payload = self.normalize_path(self.payload_var.get())
+        requirement_changed = self.has_requirement_changed()
         has_workspace = bool(self.workspace_var.get().strip() and self.battle_root_var.get().strip())
         task_dir_in_workspace = bool(task_dir and self.path_belongs_to_current_temp_workspace(task_dir))
         payload_in_workspace = bool(payload and self.path_belongs_to_current_temp_workspace(payload))
@@ -2413,7 +2540,7 @@ class SkillWriterApp:
             flags["preview"] = False
             flags["copy"] = False
             flags["real"] = False
-        selection_error = self.validate_current_workspace_selection()
+        selection_error = "" if requirement_changed else self.validate_current_workspace_selection()
 
         can_develop = has_workspace and not busy
         can_audit = has_workspace and has_task_dir and has_payload and flags["develop"] and not busy and not selection_error
@@ -2434,7 +2561,10 @@ class SkillWriterApp:
             next_message = selection_error
         elif not flags["develop"]:
             recommended = "develop"
-            next_message = "下一步：执行“开发技能（Codex）”。"
+            if requirement_changed:
+                next_message = "下一步：检测到技能描述已变更，请按新需求执行“开发技能”。"
+            else:
+                next_message = "下一步：执行“开发技能（Codex）”。"
         elif not has_task_dir or not has_payload:
             recommended = ""
             next_message = "下一步：刷新并确认本次开发产物目录与 payload。"
@@ -2476,6 +2606,7 @@ class SkillWriterApp:
             "next_message": next_message,
             "recommended": recommended,
             "reset_state": self.get_workflow_reset_state(),
+            "requirement_changed": requirement_changed,
         }
 
     def step_to_task_name(self, step_key: str) -> str:
@@ -3256,17 +3387,22 @@ class SkillWriterApp:
         self.latest_task_dir_var.set(entry.task_dir)
         self.dedupe_var.set(entry.dedupe_existing)
 
-        self.description_text.delete("1.0", "end")
-        self.description_text.insert("1.0", entry.skill_description)
-        self.protected_text.delete("1.0", "end")
-        self.protected_text.insert("1.0", entry.protected_files)
-        self.constraints_text.delete("1.0", "end")
-        self.constraints_text.insert("1.0", entry.additional_constraints)
+        self.suppress_requirement_change = True
+        try:
+            self.description_text.delete("1.0", "end")
+            self.description_text.insert("1.0", entry.skill_description)
+            self.protected_text.delete("1.0", "end")
+            self.protected_text.insert("1.0", entry.protected_files)
+            self.constraints_text.delete("1.0", "end")
+            self.constraints_text.insert("1.0", entry.additional_constraints)
+        finally:
+            self.suppress_requirement_change = False
 
         self.refresh_battle_root()
         self.refresh_model_note()
         self.refresh_command_preview()
         self.refresh_prompt()
+        self.accept_current_requirement_context()
         self.status_var.set("已回填历史记录")
         self.update_action_buttons()
 
@@ -3763,13 +3899,18 @@ class SkillWriterApp:
                 self.claude_extra_args_var.set(entry.codex_extra_args)
             else:
                 self.codex_extra_args_var.set(entry.codex_extra_args)
-        self.description_text.delete("1.0", "end")
-        self.description_text.insert("1.0", entry.skill_description)
-        self.protected_text.delete("1.0", "end")
-        self.protected_text.insert("1.0", entry.protected_files)
-        self.constraints_text.delete("1.0", "end")
-        self.constraints_text.insert("1.0", entry.additional_constraints)
-        self.refresh_prompt()
+        self.suppress_requirement_change = True
+        try:
+            self.description_text.delete("1.0", "end")
+            self.description_text.insert("1.0", entry.skill_description)
+            self.protected_text.delete("1.0", "end")
+            self.protected_text.insert("1.0", entry.protected_files)
+            self.constraints_text.delete("1.0", "end")
+            self.constraints_text.insert("1.0", entry.additional_constraints)
+            self.refresh_prompt()
+            self.accept_current_requirement_context()
+        finally:
+            self.suppress_requirement_change = False
         if not self.validate_workspace():
             return
 
@@ -4215,6 +4356,9 @@ class SkillWriterApp:
         if not prompt:
             messagebox.showerror("错误", "Prompt 不能为空")
             return
+        if state.get("requirement_changed"):
+            self.detach_old_artifacts_for_new_requirement()
+            self.accept_current_requirement_context()
         resume_match = self.find_resumable_develop_task(prompt)
         resume_key = ""
         resume_session_id = ""
@@ -4249,6 +4393,8 @@ class SkillWriterApp:
                     )
                 )
             )
+        else:
+            run_prompt = self.build_named_task_develop_prompt(prompt)
         active_key = resume_key or self.develop_resume_key(prompt)
         self.last_task_error_message = ""
         self.save_settings()
