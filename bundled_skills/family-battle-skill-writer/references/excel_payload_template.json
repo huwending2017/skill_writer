@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "targets": {
+    "skill_workbook": "G:\\slg\\wm_cehua\\wm_design_config\\J_技能表_skill.xlsx",
+    "war_paper_workbook": "G:\\slg\\wm_cehua\\wm_design_config\\Z_战报表.xlsx"
+  },
+  "rows": {
+    "skill": [
+      {
+        "id": 52321,
+        "name": "命运回响",
+        "desc": "每回合开始时有概率投掷命运骰子，并根据点数触发不同效果。",
+        "de_desc": "每回合开始时有概率投掷命运骰子，并根据点数触发不同效果。",
+        "quality": 5,
+        "type": 1,
+        "skill_type": 1,
+        "work_type": 8,
+        "ready": 0,
+        "cd": 0,
+        "skill_lv": 10,
+        "max_lv": 10,
+        "coin_cost": 10000,
+        "chance": 10000,
+        "fit_arms": [1, 2, 3, 4, 5],
+        "study_need": [4, 10, 10],
+        "learn_times": 1,
+        "special_script": "",
+        "special_param": [],
+        "person": [],
+        "inherit_hero": [],
+        "hide_in_list": 0
+      }
+    ],
+    "skill_stage": [
+      {
+        "skill_id": 52321,
+        "desc": "每回合开始时挂载命运回响监听 Buff。",
+        "skill_level": 10,
+        "stage": 1,
+        "camp": 2,
+        "target": 6,
+        "sex": 0,
+        "attr": 0,
+        "script": "add_buff",
+        "param": [[5232111]],
+        "chance": 10000,
+        "attack_per": 1
+      }
+    ],
+    "buff": [
+      {
+        "id": 5232111,
+        "name": "命运回响",
+        "desc": "命运回响主 Buff",
+        "time_add": 0,
+        "level": 10,
+        "type": 0,
+        "is_dispel": 2,
+        "type_id": 0,
+        "is_dead_clear": 2,
+        "ready": 0,
+        "time": 8,
+        "add_type": 4,
+        "add_max": 1,
+        "update_life": 1,
+        "chance": 10000,
+        "script": "fate_echo_temp",
+        "param": [
+          [5000, "INTELLECT", 10000],
+          [1, 0],
+          ["INTELLECT", 8000]
+        ],
+        "attack_per": 1
+      }
+    ],
+    "war_paper": [
+      {
+        "ID": 903521,
+        "name": "skill_dice_52321",
+        "type": 4,
+        "desc1": "%s投掷【命运骰子】，点数为：%s",
+        "cost_time": 0,
+        "action_type": 0,
+        "beizhu2": "52321 临时战报文案",
+        "param1": "武将名字",
+        "param2": "点数"
+      }
+    ]
+  }
+}
