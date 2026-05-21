@@ -163,6 +163,34 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+PAYLOAD_SHEET_NAMES = ("skill", "skill_global", "skill_stage", "buff", "war_paper")
+
+
+def ensure_payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
+    """Accept both the canonical rows payload and older sheet-at-root payloads."""
+
+    rows = payload.get("rows")
+    if isinstance(rows, dict):
+        return payload
+
+    detected_rows: dict[str, Any] = {}
+    for sheet_name in PAYLOAD_SHEET_NAMES:
+        sheet_rows = payload.get(sheet_name)
+        if isinstance(sheet_rows, list):
+            detected_rows[sheet_name] = sheet_rows
+
+    if not detected_rows:
+        return payload
+
+    normalized = {
+        key: value
+        for key, value in payload.items()
+        if key not in PAYLOAD_SHEET_NAMES and key != "rows"
+    }
+    normalized["rows"] = detected_rows
+    return normalized
+
+
 USER_VISIBLE_PAYLOAD_FIELDS = {
     "name",
     "desc",
@@ -232,6 +260,7 @@ def normalize_excel_config_literals_in_string(value: str) -> str:
 
 
 def normalize_excel_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = ensure_payload_rows(payload)
     rows = payload.get("rows")
     if not isinstance(rows, dict):
         return payload
@@ -421,7 +450,13 @@ def audit_lua_chinese_comments(path: Path) -> list[str]:
     if "local function debug_log" in text or "debug_log(" in text:
         errors.append(f"{path.name} 不允许使用 debug_log 包装函数；请在真实分支行直接调用 DEBUG(\"[技能名]\", ...)，保证战斗日志行号指向实际逻辑")
 
-    if "make_effect_records" in text and "extern.skill" in text and "insert_effect_list(extern.skill" not in text:
+    inserts_back_to_current_skill = (
+        "insert_effect_list(extern.skill" in text
+        or "insert_effect_list(script.extern.skill" in text
+        or re.search(r"local\s+\w+\s*=\s*\(?script\.extern\s+and\s+script\.extern\.skill", text)
+        and re.search(r"insert_effect_list\(\s*\w+\s*,\s*nil\s*\)", text)
+    )
+    if "make_effect_records" in text and "extern.skill" in text and not inserts_back_to_current_skill:
         errors.append(
             f"{path.name} 存在事件/驻留 Buff 战报写入，但未看到 insert_effect_list(extern.skill, nil)；"
             "响应其他技能或伤害事件的战报必须插回当前 extern.skill，否则前端可能不展示或顺序漂移"

@@ -19,6 +19,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def lua_string(value: Path | str) -> str:
+    text = str(value).replace("\\", "/")
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def configure_lua_paths(lua: object, ctx) -> None:
+    task_dir = ctx.task_dir
+    battle_root = ctx.battle_root
+    lua.execute(
+        "\n".join(
+            [
+                "package.path = package.path",
+                f"    .. ';' .. {lua_string(task_dir / '?.lua')}",
+                f"    .. ';' .. {lua_string(task_dir / '?' / '?.lua')}",
+                f"    .. ';' .. {lua_string(battle_root / '?.lua')}",
+                f"    .. ';' .. {lua_string(battle_root / '?' / '?.lua')}",
+                f"    .. ';' .. {lua_string(battle_root / '?' / '?' / '?.lua')}",
+            ]
+        )
+    )
+    lua.execute(
+        """
+DEBUG = DEBUG or function(...) end
+EVENT_DEF = EVENT_DEF or {
+    BUFF_DAMAGED_OVER = "BUFF_DAMAGED_OVER",
+    BUFF_ATTACKED_DAMAGE = "BUFF_ATTACKED_DAMAGE",
+    BUFF_ATTACKED_SHARE = "BUFF_ATTACKED_SHARE",
+    BUFF_LOSE_LIFE = "BUFF_LOSE_LIFE",
+    BUFF_OVERLYING_EFFECT_FUNC = "BUFF_OVERLYING_EFFECT_FUNC",
+}
+RECORD_NUM_DEF = RECORD_NUM_DEF or {
+    CAMP = "CAMP",
+    SKILL_ID = "SKILL_ID",
+    BUFF = "BUFF",
+    NUM = "NUM",
+}
+data_war_paper = data_war_paper or {}
+"""
+    )
+
+
 def main() -> int:
     args = parse_args()
     ctx = resolve_task_context(
@@ -91,6 +132,7 @@ def main() -> int:
         return 0
 
     lua = LuaRuntime(unpack_returned_tuples=True)
+    configure_lua_paths(lua, ctx)
     script_text = script_path.read_text(encoding="utf-8")
     previous_cwd = Path.cwd()
     try:
@@ -105,7 +147,7 @@ def main() -> int:
         print("[test] regression:", regression_path)
         previous_cwd = Path.cwd()
         try:
-            os.chdir(regression_path.parent)
+            os.chdir(ctx.task_dir)
             lua.execute(regression_path.read_text(encoding="utf-8"))
         finally:
             os.chdir(previous_cwd)

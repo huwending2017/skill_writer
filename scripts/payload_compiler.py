@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skill_artifact_utils import TaskContext, load_json, normalize_excel_config_payload
+from skill_artifact_utils import TaskContext, ensure_payload_rows, load_json, normalize_excel_config_payload
 
 
 DEFAULT_MAX_LEVEL = 10
@@ -165,7 +165,31 @@ def _expand_stage_rows(rows: list[dict[str, Any]], skill_rows: list[dict[str, An
     return expanded
 
 
-def _expand_buff_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _infer_buff_max_level(buff_id: int, group: list[dict[str, Any]], skill_rows: list[dict[str, Any]]) -> int:
+    known_levels = [_to_int(item.get("level"), -1) for item in group]
+    known_max = max([level for level in known_levels if level >= 0], default=-1)
+
+    matching_skill_max: list[int] = []
+    buff_id_text = str(buff_id)
+    for skill_row in skill_rows:
+        skill_id = _to_int(skill_row.get("id"), -1)
+        if skill_id < 0:
+            continue
+        if buff_id_text.startswith(str(skill_id)):
+            matching_skill_max.append(_to_int(skill_row.get("max_lv"), DEFAULT_MAX_LEVEL))
+
+    if matching_skill_max:
+        return max(matching_skill_max)
+
+    explicit_max_levels = _explicit_max_levels(group)
+    if explicit_max_levels:
+        return max(explicit_max_levels)
+
+    return max(known_max, _category_default_max_level(group))
+
+
+def _expand_buff_rows(rows: list[dict[str, Any]], skill_rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    skill_rows = skill_rows or []
     grouped: dict[int, list[dict[str, Any]]] = {}
     for row in rows:
         buff_id = _to_int(row.get("id"), -1)
@@ -175,12 +199,7 @@ def _expand_buff_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for buff_id in sorted(grouped):
         group = grouped[buff_id]
         template = max(group, key=lambda item: _to_int(item.get("level"), 0))
-        explicit_max_levels = _explicit_max_levels(group)
-        if explicit_max_levels:
-            max_lv = max(explicit_max_levels)
-        else:
-            max_lv = max(_to_int(item.get("level"), DEFAULT_MAX_LEVEL) for item in group)
-            max_lv = max(max_lv, _category_default_max_level(group))
+        max_lv = _infer_buff_max_level(buff_id, group, skill_rows)
         by_level = {_to_int(item.get("level"), 0): dict(item) for item in group}
         for level in range(0, max_lv + 1):
             row = dict(by_level.get(level, template))
@@ -259,7 +278,7 @@ def expand_payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
     stage_rows = [normalize_row("skill_stage", row) for row in rows.get("skill_stage", [])]
     stage_rows = _expand_stage_rows(stage_rows, skill_rows)
     buff_rows = [normalize_row("buff", row) for row in rows.get("buff", [])]
-    buff_rows = _expand_buff_rows(buff_rows)
+    buff_rows = _expand_buff_rows(buff_rows, skill_rows)
     war_rows = [normalize_row("war_paper", row) for row in rows.get("war_paper", [])]
 
     expanded_payload = dict(payload)
@@ -456,7 +475,7 @@ def compile_payload_to_artifacts(ctx: TaskContext) -> CompileResult:
     if ctx.payload_path is None or not ctx.payload_path.exists():
         raise FileNotFoundError("temp_excel_payload.json not found")
 
-    payload = load_json(ctx.payload_path)
+    payload = ensure_payload_rows(load_json(ctx.payload_path))
     if "rows" not in payload or not isinstance(payload["rows"], dict):
         raise ValueError("payload must contain rows object")
     payload = normalize_excel_config_payload(payload)

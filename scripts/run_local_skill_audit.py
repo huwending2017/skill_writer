@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
+from payload_compiler import expand_payload_rows
 from skill_artifact_utils import (
     IMPLEMENTATION_NAME,
     TEMP_CONFIG_NAME,
@@ -15,8 +17,10 @@ from skill_artifact_utils import (
     existing_buff_paths,
     find_invalid_excel_config_literals,
     find_suspicious_question_mark_fields,
+    ensure_payload_rows,
     is_task_owned_lua_script,
     load_json,
+    normalize_excel_config_payload,
     resolve_task_context,
 )
 
@@ -361,7 +365,13 @@ def main() -> int:
     if ctx.payload_path is None or not ctx.payload_path.exists():
         errors.append("缺少 temp_excel_payload.json")
     else:
-        payload = load_json(ctx.payload_path)
+        payload = normalize_excel_config_payload(ensure_payload_rows(load_json(ctx.payload_path)))
+        if isinstance(payload.get("rows"), dict):
+            payload = expand_payload_rows(payload)
+        ctx.payload_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         suspicious_fields = find_suspicious_question_mark_fields(payload)
         if suspicious_fields:
             errors.append("payload 中存在疑似乱码问号字段，请先修复 temp_excel_payload.json 后再继续。")
