@@ -61,12 +61,16 @@ function New-ReleaseManifest {
         "Skill Writer Desktop Release",
         "GeneratedAt: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
         "ZipName: $ZipName",
-        "ExeName: SkillWriterDesktop.exe",
-        "ExeSize: $($exeItem.Length)",
+        "FolderExe: SkillWriterDesktop\SkillWriterDesktop.exe",
+        "FolderExeSize: $($exeItem.Length)",
+        "PortableExe: SkillWriterDesktopPortable.exe",
         "Usage:",
         "1. Unzip this package on the target Windows machine.",
-        "2. Run start_skill_writer_desktop.bat or SkillWriterDesktop.exe.",
-        "3. The target machine still needs a working Codex or Claude CLI/login/API-key environment."
+        "2. Recommended: run SkillWriterDesktopPortable.exe. It is a single-file build and avoids missing _internal files.",
+        "3. Alternative: open the SkillWriterDesktop folder and run start_skill_writer_desktop.bat.",
+        "4. Do not copy SkillWriterDesktop\SkillWriterDesktop.exe alone; it must stay beside the SkillWriterDesktop\_internal directory.",
+        "5. If Windows blocks the program after transfer, right-click the zip or exe, open Properties, choose Unblock, then unzip again.",
+        "6. The target machine still needs a working Codex or Claude CLI/login/API-key environment."
     )
     $manifest | Set-Content -LiteralPath $OutputPath -Encoding UTF8
 }
@@ -79,11 +83,15 @@ $env:PYTHONUTF8 = "1"
 
 $appDir = Join-Path $projectRoot "dist\SkillWriterDesktop"
 $exePath = Join-Path $appDir "SkillWriterDesktop.exe"
+$portableDist = Join-Path $projectRoot "dist_onefile"
+$portableExePath = Join-Path $portableDist "SkillWriterDesktopPortable.exe"
 $releaseDir = Join-Path $projectRoot "release"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $zipName = "SkillWriterDesktop_$timestamp.zip"
 $zipPath = Join-Path $releaseDir $zipName
-$manifestPath = Join-Path $appDir "RELEASE_NOTES.txt"
+$stageDir = Join-Path $releaseDir "_stage_$timestamp"
+$stageAppDir = Join-Path $stageDir "SkillWriterDesktop"
+$manifestPath = Join-Path $stageDir "RELEASE_NOTES.txt"
 
 Write-Host "[release] project root: $projectRoot"
 
@@ -93,6 +101,14 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed"
     }
+
+    Write-Host "[release] building single-file portable exe"
+    Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build_onefile")
+    Remove-PathWithRetry -TargetPath $portableDist
+    python -B -m PyInstaller --noconfirm --clean --distpath $portableDist --workpath (Join-Path $projectRoot "build_onefile") (Join-Path $projectRoot "SkillWriterDesktopPortable.spec")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Portable build failed"
+    }
 } else {
     Write-Host "[release] skip build requested"
 }
@@ -100,19 +116,27 @@ if (-not $SkipBuild) {
 if (-not (Test-Path -LiteralPath $exePath)) {
     throw "EXE not found. Build first or run without -SkipBuild: $exePath"
 }
+if (-not (Test-Path -LiteralPath $portableExePath)) {
+    throw "Portable EXE not found. Build first or run without -SkipBuild: $portableExePath"
+}
 
 if (-not (Test-Path -LiteralPath $releaseDir)) {
     New-Item -ItemType Directory -Path $releaseDir | Out-Null
 }
 
 Remove-PythonCaches -RootPath $appDir
-New-ReleaseManifest -AppDir $appDir -ZipName $zipName -OutputPath $manifestPath
+Remove-PythonCaches -RootPath $portableDist
+Remove-PathWithRetry -TargetPath $stageDir
+New-Item -ItemType Directory -Path $stageDir | Out-Null
+Copy-Item -LiteralPath $appDir -Destination $stageAppDir -Recurse -Force
+Copy-Item -LiteralPath $portableExePath -Destination (Join-Path $stageDir "SkillWriterDesktopPortable.exe") -Force
+New-ReleaseManifest -AppDir $stageAppDir -ZipName $zipName -OutputPath $manifestPath
 
 if ((Test-Path -LiteralPath $zipPath) -and -not $KeepExistingZip) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 
-Write-Host "[release] packaging: $appDir"
+Write-Host "[release] packaging: $stageDir"
 Write-Host "[release] output: $zipPath"
 
 $maxAttempts = 3
@@ -121,7 +145,7 @@ for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         if ((Test-Path -LiteralPath $zipPath) -and -not $KeepExistingZip) {
             Remove-Item -LiteralPath $zipPath -Force
         }
-        [System.IO.Compression.ZipFile]::CreateFromDirectory($appDir, $zipPath)
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($stageDir, $zipPath)
         break
     } catch {
         if ($attempt -eq $maxAttempts) {
@@ -142,6 +166,8 @@ $hashPath = "$zipPath.sha256.txt"
 
 Remove-PythonCaches -RootPath $projectRoot
 Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build")
+Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build_onefile")
+Remove-PathWithRetry -TargetPath $stageDir
 
 Write-Host "[release] done"
 Write-Host "[release] zip: $zipPath"
