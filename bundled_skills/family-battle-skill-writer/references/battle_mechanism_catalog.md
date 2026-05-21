@@ -534,6 +534,75 @@ Quality gates:
 - Confirm no old state leaks into the next battle or next real buff application after actual lifecycle end.
 - Check command skills, passive skills, and equipment effects explicitly when the new buff is resident or has persistent state.
 
+## Family 19: Resident Self-Damage Threshold Plus Ally Share Transfer Bundle
+
+Use when one canonical resident buff must own all of the following in one runtime:
+
+- self-side `BUFF_ATTACKED_DAMAGE` threshold judgment
+- ally-side share interception through `BUFF_ATTACKED_SHARE`
+- delayed transfer to the owner after the ally actually loses life through `BUFF_LOSE_LIFE`
+- linked provider skills that only add extra reduction or dispel behavior
+- one visible stack family and one follow-up stack family with ordered report output
+
+Primary references:
+
+- `module/buffs_new/buff_yuefei_jingzhong.lua`
+- `module/buffs_new/buff_share.lua`
+- `module/buffs_new/buff_share_for_target.lua`
+- `module/buffs_new/buff_injured_by_hp.lua`
+- `module/buffs_new/buff_add_state.lua`
+
+Canonical composition:
+
+- one resident listener buff stores long-lived runtime such as loyalty layers, lost-layer progress, follow-up stack count, one-time trigger flags, and per-target share cache
+- a display-only overlying buff carries the visible self stack count when the visible stack should not itself own the full mechanic
+- static per-stack gains reuse `buff_add_attr.lua` / `buff_add_attr_p.lua`
+- linked skills that only add "per current stack extra reduction" or "every N lost stacks dispel once" use `buff_add_state.lua`
+- the resident consumer reads provider state in real time so temporary invalidation and restore can pause and resume cleanly
+
+Trigger ordering rules:
+
+1. Resolve direct self damage reduction in `BUFF_ATTACKED_DAMAGE` before checking whether the same hit should consume a stack.
+2. Cache ally share amount in `BUFF_ATTACKED_SHARE`, but do not immediately damage the owner there.
+3. After the ally actually loses life, transfer the cached value to the owner in `BUFF_LOSE_LIFE`.
+4. If transferred damage should benefit from the same linked received-damage reduction, consume that provider state again in the transfer entrance.
+5. Do not run the self-threshold stack-loss judgment a second time for the transferred damage unless the design explicitly says so.
+
+Good fit:
+
+- "self has X initial loyalty layers"
+- "when self takes a big enough hit, lose one layer and reduce this hit"
+- "while loyalty is above threshold, take part of ally damage"
+- "every N lost loyalty layers, gain another stack family and immediately attack"
+- "linked skills only add per-stack reduction or dispel after loyalty loss"
+
+Why a new script may be required:
+
+- existing `buff_share.lua` and `buff_injured_by_hp.lua` each solve only one side of the chain
+- the bundle needs one ordered runtime that spans direct self damage, ally transfer, stack conversion, one-time trigger flags, custom reports, and linked provider consumption
+- a pure attr-buff implementation cannot reliably cover transferred damage paths that are applied later through `change_hp(...)`
+
+## Battle Report Coverage Method
+
+Use this method before implementing any mechanic that changes state, damage, healing, control, dispel, or visible stacks. Battle reports are a player-facing contract, so the implementation must design them alongside the runtime logic instead of adding them at the end.
+
+Required coverage matrix in `docs/IMPLEMENTATION.md`:
+
+- Trigger entrance: which event or action inserts the report, and whether it is written into the current skill, `extern.skill`, or a resident buff effect list.
+- Success and non-success branches: probability success, probability fail, no target, immune/invalid, cap reached, already active, no removable buff, and no-op branches.
+- State mutation: stack gain, stack loss, stack conversion, current visible value, internal runtime value when different from display, state add, state expire, temporary invalidation, and restore.
+- Numeric result: damage dealt, damage reduced, damage shared, healing, shield, attribute gain, lifesteal/counterattack/drain gain, and any per-layer total that players need to understand.
+- Threshold behavior: first time reaching a threshold, later reaches, one-time flags, cooldown/round limits, and reset timing.
+- Ordering: the report must appear next to the mechanic that caused it. Damage-triggered stack consumption should report around the damage event, not deferred to a later round-end batch unless the design explicitly says it is delayed.
+- Placeholder mapping: list each `war_paper` text placeholder and the exact Lua `num_list` order. Use `RECORD_NUM_DEF.PERCENT_TYPE` for percentage placeholders and avoid hardcoding percent signs in Lua values.
+
+Runtime insertion rules:
+
+- Action-owned reports can usually remain on `script.skill`.
+- Resident buffs that respond to another skill or damage event must insert through the current `extern.skill` flow: clean the resident effect list, add the buff word if needed, call `make_effect_records(...)`, then `insert_effect_list(extern.skill, nil)`.
+- A debug line saying the report was created is not enough. Verify that the front-end battle report shows the line in the intended order.
+- When one runtime operation triggers several player-visible effects, write reports in the same order as the mechanic: for example damage reduction -> final damage -> stack loss/current stack -> stack conversion -> follow-up attack/dispel/state.
+
 ## Event Lookup Shortlist
 
 Use this shortlist to reduce search time before inventing a new listener script.

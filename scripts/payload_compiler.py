@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skill_artifact_utils import TaskContext, load_json
+from skill_artifact_utils import TaskContext, load_json, normalize_excel_config_payload
 
 
 DEFAULT_MAX_LEVEL = 10
@@ -190,6 +191,67 @@ def _expand_buff_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return expanded
 
 
+RUNTIME_FLAT_LIST_FIELDS: dict[str, set[str]] = {
+    "skill": {"fit_arms", "study_need", "special_param", "person", "inherit_hero"},
+}
+
+RUNTIME_GROUPED_LIST_FIELDS: dict[str, set[str]] = {
+    "skill_stage": {"param"},
+    "buff": {"param"},
+}
+
+
+def _coerce_excel_config_token(token: str) -> Any:
+    text = token.strip()
+    if text == "":
+        return ""
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        if "." in text:
+            number = float(text)
+            return int(number) if number.is_integer() else number
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _parse_flat_excel_config(value: str) -> list[Any]:
+    stripped = value.strip()
+    if not stripped:
+        return []
+    return [_coerce_excel_config_token(part) for part in stripped.split(",") if part.strip()]
+
+
+def _parse_grouped_excel_config(value: str) -> list[list[Any]]:
+    stripped = value.strip()
+    if not stripped:
+        return []
+    groups: list[list[Any]] = []
+    for group_text in stripped.split("|"):
+        group_text = group_text.strip()
+        if not group_text:
+            continue
+        groups.append([_coerce_excel_config_token(part) for part in group_text.split(",") if part.strip()])
+    return groups
+
+
+def coerce_runtime_row(sheet_name: str, raw_row: dict[str, Any]) -> dict[str, Any]:
+    row = dict(raw_row)
+    for field in RUNTIME_FLAT_LIST_FIELDS.get(sheet_name, set()):
+        value = row.get(field)
+        if isinstance(value, str):
+            row[field] = _parse_flat_excel_config(value)
+    for field in RUNTIME_GROUPED_LIST_FIELDS.get(sheet_name, set()):
+        value = row.get(field)
+        if isinstance(value, str):
+            row[field] = _parse_grouped_excel_config(value)
+    return row
+
+
 def expand_payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
     rows = payload.get("rows", {})
     skill_rows = [normalize_row("skill", row) for row in rows.get("skill", [])]
@@ -241,9 +303,9 @@ def to_lua(value: Any, indent: int = 0) -> str:
 
 def build_temp_config_text(ctx: TaskContext, payload: dict[str, Any]) -> tuple[str, list[str], list[str], list[str], list[str]]:
     rows = payload["rows"]
-    normalized_skill = [normalize_row("skill", row) for row in rows.get("skill", [])]
-    normalized_stage = [normalize_row("skill_stage", row) for row in rows.get("skill_stage", [])]
-    normalized_buff = [normalize_row("buff", row) for row in rows.get("buff", [])]
+    normalized_skill = [coerce_runtime_row("skill", normalize_row("skill", row)) for row in rows.get("skill", [])]
+    normalized_stage = [coerce_runtime_row("skill_stage", normalize_row("skill_stage", row)) for row in rows.get("skill_stage", [])]
+    normalized_buff = [coerce_runtime_row("buff", normalize_row("buff", row)) for row in rows.get("buff", [])]
     normalized_war = [normalize_row("war_paper", row) for row in rows.get("war_paper", [])]
 
     skill_keys = [str(row["key"]) for row in normalized_skill]
@@ -299,6 +361,15 @@ def build_temp_config_text(ctx: TaskContext, payload: dict[str, Any]) -> tuple[s
         "    inject_rows(data_war_paper, TEMP_WAR_ROWS, 'name', 'ID')",
         "end",
         "",
+        "function M.rows()",
+        "    return {",
+        "        skill = TEMP_SKILL_ROWS,",
+        "        stage = TEMP_STAGE_ROWS,",
+        "        buff = TEMP_BUFF_ROWS,",
+        "        war_paper = TEMP_WAR_ROWS,",
+        "    }",
+        "end",
+        "",
         "function M.describe()",
         "    return {",
         f"        payload_source = {to_lua(str(ctx.payload_path))},",
@@ -317,7 +388,10 @@ def build_temp_config_text(ctx: TaskContext, payload: dict[str, Any]) -> tuple[s
 
 
 def build_smoke_test_text(ctx: TaskContext, result: CompileResult) -> str:
-    temp_config_rel = ctx.temp_config_path()
+    temp_config_rel = os.path.relpath(
+        result.temp_config_path,
+        result.smoke_test_path.parent,
+    ).replace("\\", "/")
     lines = [
         "package.path = package.path",
         '    .. ";./?.lua"',
@@ -385,6 +459,7 @@ def compile_payload_to_artifacts(ctx: TaskContext) -> CompileResult:
     payload = load_json(ctx.payload_path)
     if "rows" not in payload or not isinstance(payload["rows"], dict):
         raise ValueError("payload must contain rows object")
+    payload = normalize_excel_config_payload(payload)
     payload = expand_payload_rows(payload)
     ctx.payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 

@@ -27,8 +27,9 @@ Use $family-battle-skill-writer
 4. 临时产物放到 temp_skill_workspace 子目录
 5. 给出临时 skill / stage / buff / war_paper 配置
 6. 生成需要的脚本，且脚本要带详细中文注释，尽量细到每一步
-7. 给出测试步骤、预期触发链路、预期战报结果
-8. 如果一次填写多个互不关联技能，按独立批量开发处理：先拆成多个独立工作单元；环境支持时可以按技能并行做复用审计、脚本编写、单技能测试；不要构造跨技能依赖，不要让一个技能依赖另一个技能的运行时状态；最后再合并到一个 batch 临时目录和一个 payload，做统一冲突检查
+7. 战报 ID 不写进 buff.param / skill_stage.param；生产脚本中用战报配置枚举或常量名插入战报，war_paper 行 ID 留空由写表脚本续号
+8. 给出测试步骤、预期触发链路、预期战报结果
+9. 如果一次填写多个互不关联技能，按独立批量开发处理：先拆成多个独立工作单元；环境支持时可以按技能并行做复用审计、脚本编写、单技能测试；不要构造跨技能依赖，不要让一个技能依赖另一个技能的运行时状态；最后再合并到一个 batch 临时目录和一个 payload，做统一冲突检查
 ```
 
 ## Linked-Skill Bundle Template
@@ -61,7 +62,8 @@ Use $family-battle-skill-writer
 5. 如果必须新增脚本，要说明为什么现有机制不够
 6. 临时产物统一放到 temp_skill_workspace/<bundle_name>/ 下
 7. 给出 bundle 级临时配置、脚本、测试方案，且新增脚本需要带详细中文注释
-8. 说明每个技能的触发顺序、异常情况、战报展示
+8. 战报 ID 不写进 buff.param / skill_stage.param；生产脚本中用战报配置枚举或常量名插入战报，war_paper 行 ID 留空由写表脚本续号
+9. 说明每个技能的触发顺序、异常情况、战报展示
 ```
 
 ## Existing Skill Iteration Template
@@ -87,7 +89,8 @@ Use $family-battle-skill-writer
 3. 优先用 provider 状态、buff_add_state、customized_buff_state、script.extern 或已有状态 key 影响旧技能
 4. 只做最小补丁，旧技能在没有新机制时行为必须保持不变
 5. 更新必要的 temp_excel_payload.json 行，不要无意义重写旧配置
-6. 给出两组测试：无新机制回归测试；有新机制生效测试
+6. 战报 ID 不写进 buff.param / skill_stage.param；生产脚本中用战报配置枚举或常量名插入战报，war_paper 行 ID 留空由写表脚本续号
+7. 给出两组测试：无新机制回归测试；有新机制生效测试
 ```
 
 ## Minimal Fast Template
@@ -103,6 +106,7 @@ Use $family-battle-skill-writer
 2. 能复用就不要新增脚本
 3. 临时文件放到 temp_skill_workspace
 4. 输出配置、脚本、测试，脚本带详细中文注释
+5. 战报 ID 不写进 buff.param / skill_stage.param；生产脚本中用战报配置枚举或常量名插入战报，war_paper 行 ID 留空由写表脚本续号
 ```
 
 ## 建议补充的信息

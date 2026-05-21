@@ -182,6 +182,60 @@ Mechanism family:
 
 - linked bodyguard / menshen pairing
 
+### `yuefei_baoguo_hurt_reduce`
+
+Used by:
+
+- `buff_yuefei_jingzhong.lua`
+
+Mechanism family:
+
+- linked provider that contributes per-stack received-damage reduction into one existing resident listener
+
+Provider:
+
+- usually `buff_add_state.lua`
+
+Consumer contract:
+
+- shape: `{ "yuefei_baoguo_hurt_reduce", reduce_per_report_country_layer }`
+- consumer still owns the canonical loyalty/report-country runtime state
+- provider only contributes a per-layer reduction coefficient and does not create its own damage listener
+- consumer may apply the same reduction in more than one damage entrance, for example direct self damage and transferred share damage
+
+Use when:
+
+- one linked skill says "each existing stack additionally reduces received damage by X%"
+- the base resident listener already owns the stack count, threshold logic, and report order
+- the reduction must also apply to damage paths that are not cleanly covered by a standalone attr buff, such as transferred damage via `change_hp(...)`
+
+### `yuefei_loyalty_dispel`
+
+Used by:
+
+- `buff_yuefei_jingzhong.lua`
+
+Mechanism family:
+
+- linked provider that adds a follow-up dispel whenever the core resident listener consumes enough loyalty layers
+
+Provider:
+
+- usually `buff_add_state.lua`
+
+Consumer contract:
+
+- shape: `{ "yuefei_loyalty_dispel", target_def, remove_num }`
+- consumer still owns the canonical loyalty-loss counting
+- provider only contributes target rule and dispel count
+- actual target finding, confuse records, and `remove_debuff_num(...)` stay inside the main resident listener
+
+Use when:
+
+- one linked skill says "every N consumed/lost layers, dispel ally debuffs"
+- the base resident listener already owns the stack-loss timing and should remain the single source of truth
+- creating a second listener would risk double counting or report-order drift
+
 ### `ragsa_hannu_bonus_stack`
 
 Used by:

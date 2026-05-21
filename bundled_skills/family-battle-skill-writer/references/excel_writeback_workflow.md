@@ -86,7 +86,7 @@
 
 `war_paper` 直接按 Excel sheet 结构填：
 
-- `ID`
+- `ID`（新战报必须留空，由写回脚本按当前战报表最大 ID 自动续号；只有更新已存在战报时才允许复用原 ID）
 - `name`
 - `type`
 - `desc1`
@@ -96,6 +96,12 @@
 - `effect_desc`
 - `beizhu2`
 - `param1...param8`
+
+战报配置准则：
+
+- 不要把战报 ID 塞进 `buff.param` / `skill_stage.param` / 其他技能配置参数。
+- 生产 `buff_*.lua` / `action_*.lua` 需要插入战报时，在脚本中通过战报配置枚举、常量名或运行时已有的名称映射来引用，避免 Excel 回写续号后参数失效。
+- payload 中不要预填很大的临时战报 ID；写回脚本会以 `Z_战报表.xlsx` 当前最大 ID 为起点追加。
 
 ## 列化规则
 

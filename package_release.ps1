@@ -1,33 +1,125 @@
+param(
+    [switch]$SkipBuild,
+    [switch]$KeepExistingZip
+)
+
 $ErrorActionPreference = "Stop"
+
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+function Remove-PathWithRetry {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath,
+        [int]$RetryCount = 5,
+        [int]$SleepSeconds = 2
+    )
+
+    if (-not (Test-Path -LiteralPath $TargetPath)) {
+        return
+    }
+
+    for ($i = 1; $i -le $RetryCount; $i++) {
+        try {
+            Remove-Item -LiteralPath $TargetPath -Recurse -Force
+            return
+        } catch {
+            if ($i -eq $RetryCount) {
+                throw
+            }
+            Write-Host "[release] path busy, retrying remove: $TargetPath"
+            Start-Sleep -Seconds $SleepSeconds
+        }
+    }
+}
+
+function Remove-PythonCaches {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath
+    )
+
+    Get-ChildItem -LiteralPath $RootPath -Recurse -Force -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+    Get-ChildItem -LiteralPath $RootPath -Recurse -Force -File -Filter "*.pyc" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+}
+
+function New-ReleaseManifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AppDir,
+        [Parameter(Mandatory = $true)]
+        [string]$ZipName,
+        [Parameter(Mandatory = $true)]
+        [string]$OutputPath
+    )
+
+    $exePath = Join-Path $AppDir "SkillWriterDesktop.exe"
+    $exeItem = Get-Item -LiteralPath $exePath
+    $manifest = @(
+        "Skill Writer Desktop Release",
+        "GeneratedAt: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+        "ZipName: $ZipName",
+        "ExeName: SkillWriterDesktop.exe",
+        "ExeSize: $($exeItem.Length)",
+        "Usage:",
+        "1. Unzip this package on the target Windows machine.",
+        "2. Run start_skill_writer_desktop.bat or SkillWriterDesktop.exe.",
+        "3. The target machine still needs a working Codex or Claude CLI/login/API-key environment."
+    )
+    $manifest | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+}
+
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $projectRoot
+$env:PYTHONDONTWRITEBYTECODE = "1"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+
 $appDir = Join-Path $projectRoot "dist\SkillWriterDesktop"
 $exePath = Join-Path $appDir "SkillWriterDesktop.exe"
 $releaseDir = Join-Path $projectRoot "release"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$zipPath = Join-Path $releaseDir "SkillWriterDesktop_$timestamp.zip"
+$zipName = "SkillWriterDesktop_$timestamp.zip"
+$zipPath = Join-Path $releaseDir $zipName
+$manifestPath = Join-Path $appDir "RELEASE_NOTES.txt"
 
-if (-not (Test-Path $exePath)) {
-    throw "EXE not found. Build first with build_exe.ps1: $exePath"
+Write-Host "[release] project root: $projectRoot"
+
+if (-not $SkipBuild) {
+    Write-Host "[release] building application"
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot "build_exe.ps1")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Build failed"
+    }
+} else {
+    Write-Host "[release] skip build requested"
 }
 
-if (-not (Test-Path $releaseDir)) {
+if (-not (Test-Path -LiteralPath $exePath)) {
+    throw "EXE not found. Build first or run without -SkipBuild: $exePath"
+}
+
+if (-not (Test-Path -LiteralPath $releaseDir)) {
     New-Item -ItemType Directory -Path $releaseDir | Out-Null
+}
+
+Remove-PythonCaches -RootPath $appDir
+New-ReleaseManifest -AppDir $appDir -ZipName $zipName -OutputPath $manifestPath
+
+if ((Test-Path -LiteralPath $zipPath) -and -not $KeepExistingZip) {
+    Remove-Item -LiteralPath $zipPath -Force
 }
 
 Write-Host "[release] packaging: $appDir"
 Write-Host "[release] output: $zipPath"
 
-if (Test-Path $zipPath) {
-    Remove-Item $zipPath -Force
-}
-
 $maxAttempts = 3
 for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
     try {
-        if (Test-Path $zipPath) {
-            Remove-Item $zipPath -Force
+        if ((Test-Path -LiteralPath $zipPath) -and -not $KeepExistingZip) {
+            Remove-Item -LiteralPath $zipPath -Force
         }
         [System.IO.Compression.ZipFile]::CreateFromDirectory($appDir, $zipPath)
         break
@@ -40,9 +132,17 @@ for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
     }
 }
 
-if (-not (Test-Path $zipPath)) {
+if (-not (Test-Path -LiteralPath $zipPath)) {
     throw "Release zip was not created: $zipPath"
 }
 
+$hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
+$hashPath = "$zipPath.sha256.txt"
+"$($hash.Hash)  $zipName" | Set-Content -LiteralPath $hashPath -Encoding ASCII
+
+Remove-PythonCaches -RootPath $projectRoot
+Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build")
+
 Write-Host "[release] done"
 Write-Host "[release] zip: $zipPath"
+Write-Host "[release] sha256: $hashPath"

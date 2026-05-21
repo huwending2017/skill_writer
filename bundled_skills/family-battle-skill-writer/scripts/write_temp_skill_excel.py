@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import json
 import re
@@ -215,6 +216,7 @@ def load_payload(path: Path) -> Dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if "rows" not in data or not isinstance(data["rows"], dict):
         raise ValueError("payload must contain a top-level 'rows' object")
+    data = normalize_excel_config_payload(data)
     suspicious_fields = find_suspicious_question_mark_fields(data)
     if suspicious_fields:
         details = "\n".join(f"  - {item}" for item in suspicious_fields[:20])
@@ -242,6 +244,81 @@ USER_VISIBLE_PAYLOAD_FIELDS = {
     "param7",
     "param8",
 }
+
+JSONISH_LIST_FRAGMENT_RE = re.compile(r"\[[^\[\]\r\n]*['\"][^\[\]\r\n]*\]")
+JSONISH_DICT_FRAGMENT_RE = re.compile(r"\{[^{}\r\n]*[:=][^{}\r\n]*\}")
+
+
+def is_excel_config_scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def excel_config_scalar_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def excel_config_literal_text(value: Any) -> str | None:
+    if isinstance(value, (list, tuple)):
+        if all(is_excel_config_scalar(item) for item in value):
+            return ",".join(excel_config_scalar_text(item) for item in value)
+        if all(isinstance(item, (list, tuple)) for item in value):
+            parts: List[str] = []
+            for item in value:
+                if not all(is_excel_config_scalar(part) for part in item):
+                    return None
+                parts.append(",".join(excel_config_scalar_text(part) for part in item))
+            return "|".join(parts)
+    return None
+
+
+def normalize_excel_config_literals_in_string(value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        fragment = match.group(0)
+        try:
+            parsed = ast.literal_eval(fragment)
+        except (SyntaxError, ValueError):
+            return fragment
+        text = excel_config_literal_text(parsed)
+        return text if text is not None else fragment
+
+    return JSONISH_LIST_FRAGMENT_RE.sub(replace, value)
+
+
+def normalize_excel_config_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    rows = payload.get("rows")
+    if not isinstance(rows, dict):
+        return payload
+    normalized = dict(payload)
+    normalized_rows: Dict[str, Any] = {}
+    for sheet_name, sheet_rows in rows.items():
+        if not isinstance(sheet_rows, list):
+            normalized_rows[sheet_name] = sheet_rows
+            continue
+        normalized_sheet_rows: List[Any] = []
+        for row in sheet_rows:
+            if not isinstance(row, dict):
+                normalized_sheet_rows.append(row)
+                continue
+            normalized_row: Dict[str, Any] = {}
+            for field, value in row.items():
+                if isinstance(value, str):
+                    normalized_row[field] = normalize_excel_config_literals_in_string(value)
+                elif isinstance(value, dict):
+                    raise ValueError(
+                        f"{sheet_name} field {field} uses a dict value; Excel config cells must use comma/pipe text."
+                    )
+                else:
+                    normalized_row[field] = value
+            normalized_sheet_rows.append(normalized_row)
+        normalized_rows[sheet_name] = normalized_sheet_rows
+    normalized["rows"] = normalized_rows
+    return normalized
 
 
 def find_suspicious_question_mark_fields(payload: Dict[str, Any], limit: int = 20) -> List[str]:
@@ -520,7 +597,13 @@ def stringify_scalar(value: Any) -> str:
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else str(value)
     if isinstance(value, (int, str)):
-        return str(value)
+        return normalize_excel_config_literals_in_string(str(value))
+    if isinstance(value, dict):
+        raise ValueError("Excel config cells cannot contain dict values; use comma/pipe text instead")
+    if isinstance(value, (list, tuple)):
+        text = excel_config_literal_text(value)
+        if text is not None:
+            return text
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -687,6 +770,14 @@ def value_at(row_values: Sequence[Any], col: int) -> Any:
     return row_values[index]
 
 
+def parse_positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 def get_existing_row_signatures_from_values(
     sheet_name: str,
     row_values: Sequence[Any],
@@ -801,11 +892,12 @@ def build_openpyxl_sheet_state(
     ws: Any,
     sheet_name: str,
     data_start_row: int,
-) -> Tuple[Dict[Tuple[str, str], List[int]], int]:
+) -> Tuple[Dict[Tuple[str, str], List[int]], Dict[int, List[Any]], int]:
     schema = SHEET_SCHEMAS[sheet_name]
     unique_column = schema["unique_column"]
     max_col = signature_read_max_col(sheet_name)
     signature_map: Dict[Tuple[str, str], List[int]] = {}
+    row_values_by_index: Dict[int, List[Any]] = {}
     last_row = data_start_row - 1
 
     for row_idx, row_values in enumerate(
@@ -815,6 +907,7 @@ def build_openpyxl_sheet_state(
         normalized_values = list(row_values)
         if len(normalized_values) < max_col:
             normalized_values.extend([""] * (max_col - len(normalized_values)))
+        row_values_by_index[row_idx] = normalized_values
         if normalize_match_value(value_at(normalized_values, unique_column)):
             last_row = row_idx
         for signature in get_existing_row_signatures_from_values(sheet_name, normalized_values):
@@ -822,7 +915,36 @@ def build_openpyxl_sheet_state(
             if row_idx not in rows:
                 rows.append(row_idx)
 
-    return signature_map, last_row
+    return signature_map, row_values_by_index, last_row
+
+
+def next_war_paper_id(row_values_by_index: Dict[int, List[Any]]) -> int:
+    max_id = 0
+    for row_values in row_values_by_index.values():
+        row_id = parse_positive_int(value_at(row_values, 1))
+        if row_id and row_id > max_id:
+            max_id = row_id
+    return max_id + 1
+
+
+def assign_war_paper_id(
+    row: Dict[str, Any],
+    matched_rows: Set[int],
+    row_values_by_index: Dict[int, List[Any]],
+    next_id_ref: List[int],
+) -> None:
+    for row_idx in sorted(matched_rows):
+        row_values = row_values_by_index.get(row_idx, [])
+        existing_id = parse_positive_int(value_at(row_values, 1))
+        if existing_id:
+            row["ID"] = existing_id
+            return
+
+    # Payloads generated during skill development should not decide new war-report IDs.
+    # Always append from the current workbook max so large placeholder IDs do not leak
+    # into the formal war report table.
+    row["ID"] = next_id_ref[0]
+    next_id_ref[0] += 1
 
 
 def delete_rows_desc_openpyxl(ws: Any, row_indexes: Iterable[int], dry_run: bool) -> List[str]:
@@ -1087,17 +1209,26 @@ def write_sheet_rows_openpyxl(
     schema = SHEET_SCHEMAS[sheet_name]
     data_start_row = schema["data_start_row"]
     field_to_col = schema["field_to_col"]
-    signature_map, last_row = build_openpyxl_sheet_state(ws, sheet_name, data_start_row)
+    signature_map, row_values_by_index, last_row = build_openpyxl_sheet_state(ws, sheet_name, data_start_row)
     logs: List[str] = []
     rows_to_delete: Set[int] = set()
+    war_next_id_ref = [next_war_paper_id(row_values_by_index)] if sheet_name == "war_paper" else [0]
 
     for raw_row in rows:
         row = normalize_row(sheet_name, raw_row)
-        unique_value = get_unique_value(sheet_name, row)
         row_signatures = get_match_signatures(sheet_name, row)
         matched_rows: Set[int] = set()
         for signature in row_signatures:
             matched_rows.update(signature_map.get(signature, []))
+
+        if sheet_name == "war_paper":
+            assign_war_paper_id(row, matched_rows, row_values_by_index, war_next_id_ref)
+            row_signatures = get_match_signatures(sheet_name, row)
+            matched_rows = set()
+            for signature in row_signatures:
+                matched_rows.update(signature_map.get(signature, []))
+
+        unique_value = get_unique_value(sheet_name, row)
 
         row_idx = min(matched_rows) if matched_rows else None
         action = "update"
@@ -1122,7 +1253,15 @@ def write_sheet_rows_openpyxl(
         if dry_run:
             continue
 
-        write_openpyxl_row_fields(ws, row_idx, field_to_col, row)
+        output_values = list(row_values_by_index.get(row_idx, [""] * max(field_to_col.values())))
+        if len(output_values) < max(field_to_col.values()):
+            output_values.extend([""] * (max(field_to_col.values()) - len(output_values)))
+        for field, col in field_to_col.items():
+            if field not in row:
+                continue
+            output_values[col - 1] = stringify_value(row[field])
+        write_openpyxl_row_values(ws, row_idx, output_values)
+        row_values_by_index[row_idx] = output_values
 
     if rows_to_delete:
         for log in delete_rows_desc_openpyxl(ws, rows_to_delete, dry_run):
@@ -1386,14 +1525,23 @@ def write_sheet_rows(
     signature_map, row_values_by_index, last_row = build_existing_sheet_state(ws, sheet_name, data_start_row)
     logs: List[str] = []
     rows_to_delete: Set[int] = set()
+    war_next_id_ref = [next_war_paper_id(row_values_by_index)] if sheet_name == "war_paper" else [0]
 
     for raw_row in rows:
         row = normalize_row(sheet_name, raw_row)
-        unique_value = get_unique_value(sheet_name, row)
         row_signatures = get_match_signatures(sheet_name, row)
         matched_rows: Set[int] = set()
         for signature in row_signatures:
             matched_rows.update(signature_map.get(signature, []))
+
+        if sheet_name == "war_paper":
+            assign_war_paper_id(row, matched_rows, row_values_by_index, war_next_id_ref)
+            row_signatures = get_match_signatures(sheet_name, row)
+            matched_rows = set()
+            for signature in row_signatures:
+                matched_rows.update(signature_map.get(signature, []))
+
+        unique_value = get_unique_value(sheet_name, row)
 
         row_idx = min(matched_rows) if matched_rows else None
         action = "update"

@@ -13,6 +13,7 @@ from skill_artifact_utils import (
     collect_task_lua_scripts,
     existing_action_paths,
     existing_buff_paths,
+    find_invalid_excel_config_literals,
     find_suspicious_question_mark_fields,
     is_task_owned_lua_script,
     load_json,
@@ -35,6 +36,18 @@ def parse_args() -> argparse.Namespace:
 
 def _format_paths(paths: list[Path]) -> str:
     return ", ".join(str(path) for path in paths)
+
+
+def is_generated_skill_script(path: Path) -> bool:
+    try:
+        head = path.read_text(encoding="utf-8")[:4096]
+    except OSError:
+        return False
+    return "author: codex" in head.lower() or "debug_log(" in head
+
+
+def should_check_script_comments(task_dir: Path, path: Path) -> bool:
+    return is_task_owned_lua_script(task_dir, path) or is_generated_skill_script(path)
 
 
 def audit_payload_rows(payload: dict[str, Any], battle_root: Path, task_dir: Path) -> tuple[list[str], list[str], set[Path]]:
@@ -70,7 +83,7 @@ def audit_payload_rows(payload: dict[str, Any], battle_root: Path, task_dir: Pat
         else:
             print(f"[audit] stage[{index}] -> action_{script_name}.lua :: {_format_paths(matched)}")
             for path in matched:
-                if is_task_owned_lua_script(task_dir, path):
+                if should_check_script_comments(task_dir, path):
                     comment_checked_paths.add(path)
 
         params = row.get("param")
@@ -99,7 +112,7 @@ def audit_payload_rows(payload: dict[str, Any], battle_root: Path, task_dir: Pat
         else:
             print(f"[audit] buff[{index}] -> buff_{script_name}.lua :: {_format_paths(matched)}")
             for path in matched:
-                if is_task_owned_lua_script(task_dir, path):
+                if should_check_script_comments(task_dir, path):
                     comment_checked_paths.add(path)
 
     if comment_checked_paths:
@@ -174,7 +187,66 @@ def audit_payload_shape(payload: dict[str, Any]) -> list[str]:
         actual = buff_levels.get(buff_id, set())
         if actual != expected:
             errors.append(f"buff 等级不连续: id={buff_id} expected=0..{max_lv} actual={sorted(actual)}")
+
+    errors.extend(audit_war_report_config_contract(rows))
     return errors
+
+
+def audit_war_report_config_contract(rows: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    explicit_war_ids: set[int] = set()
+    for row in rows.get("war_paper", []):
+        if not isinstance(row, dict):
+            continue
+        for field in ("ID", "id", "record_id"):
+            value = row.get(field)
+            if value in (None, ""):
+                continue
+            try:
+                explicit_war_ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+    if not explicit_war_ids:
+        return errors
+
+    for row in rows.get("buff", []):
+        if not isinstance(row, dict):
+            continue
+        buff_key = row.get("key") or f"{row.get('id', '?')}_{row.get('level', '?')}"
+        for field in ("param", "param1", "param2", "param3", "param4", "param5", "param6", "param7", "param8"):
+            values = flatten_values(row.get(field))
+            matched = sorted({value for value in values if value in explicit_war_ids})
+            if matched:
+                errors.append(
+                    f"buff[{buff_key}] {field} 禁止直接引用战报ID {matched}；请在生产 Lua 中使用战报枚举/常量名插入战报"
+                )
+    return errors
+
+
+def flatten_values(value: Any) -> list[int]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, float) and value.is_integer():
+        return [int(value)]
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            return [int(text)]
+        return []
+    if isinstance(value, dict):
+        result: list[int] = []
+        for item in value.values():
+            result.extend(flatten_values(item))
+        return result
+    if isinstance(value, (list, tuple)):
+        result: list[int] = []
+        for item in value:
+            result.extend(flatten_values(item))
+        return result
+    return []
 
 
 def audit_production_script_contract(paths: list[Path]) -> list[str]:
@@ -212,6 +284,40 @@ def audit_command_skill_notes(payload: dict[str, Any], implementation_path: Path
     text = implementation_path.read_text(encoding="utf-8")
     if "失效" not in text or "恢复" not in text:
         return ["指挥技能的 IMPLEMENTATION.md 必须说明失效与恢复场景"]
+    return []
+
+
+def audit_war_report_coverage_notes(payload: dict[str, Any], implementation_path: Path, lua_paths: list[Path]) -> list[str]:
+    rows = payload.get("rows", {}) if isinstance(payload, dict) else {}
+    war_rows = rows.get("war_paper", []) if isinstance(rows, dict) else []
+    lua_text_parts: list[str] = []
+    for path in lua_paths:
+        if not path.exists() or path.suffix.lower() != ".lua":
+            continue
+        try:
+            lua_text_parts.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+    lua_text = "\n".join(lua_text_parts)
+    has_report_mechanic = bool(war_rows) or any(
+        token in lua_text
+        for token in (
+            "make_effect_records",
+            "make_confuse_records",
+            "insert_effect_list",
+            "insert_record_effect",
+            "insert_record_effect_list_last",
+        )
+    )
+    if not has_report_mechanic:
+        return []
+    if not implementation_path.exists():
+        return ["存在战报机制但缺少 IMPLEMENTATION.md，无法确认战报覆盖矩阵"]
+    text = implementation_path.read_text(encoding="utf-8", errors="ignore")
+    required_keywords = ("战报覆盖矩阵", "触发", "层数", "状态", "num_list")
+    missing = [keyword for keyword in required_keywords if keyword not in text]
+    if missing:
+        return [f"IMPLEMENTATION.md 缺少战报覆盖矩阵关键项: {', '.join(missing)}"]
     return []
 
 
@@ -261,11 +367,21 @@ def main() -> int:
             errors.append("payload 中存在疑似乱码问号字段，请先修复 temp_excel_payload.json 后再继续。")
             for item in suspicious_fields:
                 errors.append(f"疑似乱码: {item}")
+        invalid_config_literals = find_invalid_excel_config_literals(payload)
+        if invalid_config_literals:
+            errors.append(
+                "payload contains JSON/Python literal syntax that cannot be written to formal Excel/Lua config. "
+                "Use Excel config text instead; for example [\"ATK\",10000] must be ATK,10000."
+            )
+            for item in invalid_config_literals:
+                errors.append(f"invalid excel config literal: {item}")
         payload_errors, payload_warnings, task_owned_paths = audit_payload_rows(payload, ctx.battle_root, ctx.task_dir)
         errors.extend(payload_errors)
         warnings.extend(payload_warnings)
         errors.extend(audit_payload_shape(payload))
         errors.extend(audit_command_skill_notes(payload, implementation))
+        report_paths = sorted(set(task_owned_paths).union(task_lua_scripts))
+        errors.extend(audit_war_report_coverage_notes(payload, implementation, report_paths))
         errors.extend(audit_production_script_contract(sorted(task_owned_paths)))
 
     new_mechanism_files = [

@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-echo [release] Start packaging release zip
+echo [release] Start build and release packaging
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0package_release.ps1"
 if errorlevel 1 (
     echo [release] Failed.

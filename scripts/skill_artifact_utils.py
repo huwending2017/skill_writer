@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -180,6 +181,114 @@ USER_VISIBLE_PAYLOAD_FIELDS = {
     "param8",
 }
 
+JSONISH_LIST_FRAGMENT_RE = re.compile(r"\[[^\[\]\r\n]*['\"][^\[\]\r\n]*\]")
+JSONISH_DICT_FRAGMENT_RE = re.compile(r"\{[^{}\r\n]*[:=][^{}\r\n]*\}")
+
+
+def _is_excel_config_scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def _excel_config_scalar_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _excel_config_literal_text(value: Any) -> str | None:
+    if isinstance(value, (list, tuple)):
+        if all(_is_excel_config_scalar(item) for item in value):
+            return ",".join(_excel_config_scalar_text(item) for item in value)
+        if all(isinstance(item, (list, tuple)) for item in value):
+            groups: list[str] = []
+            for item in value:
+                if not all(_is_excel_config_scalar(part) for part in item):
+                    return None
+                groups.append(",".join(_excel_config_scalar_text(part) for part in item))
+            return "|".join(groups)
+    return None
+
+
+def normalize_excel_config_literals_in_string(value: str) -> str:
+    """Convert accidental JSON/Python list fragments into Excel config text.
+
+    Example: 2,5,["ATK",10000],5032605 -> 2,5,ATK,10000,5032605.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        fragment = match.group(0)
+        try:
+            parsed = ast.literal_eval(fragment)
+        except (SyntaxError, ValueError):
+            return fragment
+        text = _excel_config_literal_text(parsed)
+        return text if text is not None else fragment
+
+    return JSONISH_LIST_FRAGMENT_RE.sub(replace, value)
+
+
+def normalize_excel_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("rows")
+    if not isinstance(rows, dict):
+        return payload
+
+    normalized = dict(payload)
+    normalized_rows: dict[str, Any] = {}
+    for sheet_name, sheet_rows in rows.items():
+        if not isinstance(sheet_rows, list):
+            normalized_rows[sheet_name] = sheet_rows
+            continue
+        normalized_sheet_rows: list[Any] = []
+        for row in sheet_rows:
+            if not isinstance(row, dict):
+                normalized_sheet_rows.append(row)
+                continue
+            normalized_row: dict[str, Any] = {}
+            for field, value in row.items():
+                if isinstance(value, str):
+                    normalized_row[field] = normalize_excel_config_literals_in_string(value)
+                else:
+                    normalized_row[field] = value
+            normalized_sheet_rows.append(normalized_row)
+        normalized_rows[sheet_name] = normalized_sheet_rows
+    normalized["rows"] = normalized_rows
+    return normalized
+
+
+def find_invalid_excel_config_literals(payload: dict[str, Any], limit: int = 30) -> list[str]:
+    rows = payload.get("rows")
+    if not isinstance(rows, dict):
+        return []
+
+    findings: list[str] = []
+    for sheet_name, sheet_rows in rows.items():
+        if not isinstance(sheet_rows, list):
+            continue
+        for index, row in enumerate(sheet_rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            row_key = row.get("key") or row.get("name") or row.get("id") or index
+            for field, value in row.items():
+                if isinstance(value, dict):
+                    findings.append(f"{sheet_name}[{index}] key={row_key} field={field} uses dict literal; use comma/pipe config text")
+                elif isinstance(value, str):
+                    normalized = normalize_excel_config_literals_in_string(value)
+                    if normalized != value:
+                        findings.append(
+                            f"{sheet_name}[{index}] key={row_key} field={field} contains JSON/Python list syntax: {value[:120]}"
+                        )
+                    elif JSONISH_DICT_FRAGMENT_RE.search(value):
+                        findings.append(
+                            f"{sheet_name}[{index}] key={row_key} field={field} contains dict-like syntax: {value[:120]}"
+                        )
+                if len(findings) >= limit:
+                    return findings
+    return findings
+
 
 def find_suspicious_question_mark_fields(payload: dict[str, Any], limit: int = 20) -> list[str]:
     rows = payload.get("rows")
@@ -281,20 +390,61 @@ def audit_lua_chinese_comments(path: Path) -> list[str]:
     if len(logic_lines) < 8:
         return errors
 
-    min_chinese_comments = max(8, min(24, len(logic_lines) // 6))
+    min_chinese_comments = max(12, min(36, len(logic_lines) // 4))
     if len(chinese_comment_lines) < min_chinese_comments:
         errors.append(
             f"{path.name} 中文注释不足：当前 {len(chinese_comment_lines)} 行，至少需要 {min_chinese_comments} 行"
         )
 
+    inline_chinese_comments = [
+        line for line in lines
+        if re.match(r"\s+--.*[\u4e00-\u9fff]", line)
+    ]
+    min_inline_comments = max(6, min(24, len(logic_lines) // 12))
+    if len(inline_chinese_comments) < min_inline_comments:
+        errors.append(
+            f"{path.name} 函数内部关键逻辑注释不足：当前 {len(inline_chinese_comments)} 行，至少需要 {min_inline_comments} 行；关键 if/return、层数变化、缓存读写、监听注册、战报清理和伤害改写处需要就地中文注释"
+        )
+
     required_keywords = {
         "参数": "缺少参数含义说明",
         "事件": "缺少事件/触发时机说明",
+        "状态": "缺少状态读写说明",
+        "异常": "缺少异常/短路保护说明",
         "战报": "缺少战报插入说明",
     }
     comment_text = "\n".join(chinese_comment_lines)
     for keyword, message in required_keywords.items():
         if keyword not in comment_text:
             errors.append(f"{path.name} {message}")
+
+    if "local function debug_log" in text or "debug_log(" in text:
+        errors.append(f"{path.name} 不允许使用 debug_log 包装函数；请在真实分支行直接调用 DEBUG(\"[技能名]\", ...)，保证战斗日志行号指向实际逻辑")
+
+    if "make_effect_records" in text and "extern.skill" in text and "insert_effect_list(extern.skill" not in text:
+        errors.append(
+            f"{path.name} 存在事件/驻留 Buff 战报写入，但未看到 insert_effect_list(extern.skill, nil)；"
+            "响应其他技能或伤害事件的战报必须插回当前 extern.skill，否则前端可能不展示或顺序漂移"
+        )
+
+    if "BUFF_OVERLYING_EFFECT_FUNC" in text and re.search(r"\bruntime\.\w+\s*=\s*extern\.overlying\b", text):
+        errors.append(
+            f"{path.name} 不允许把显示 Buff 的 extern.overlying 反写到 runtime；显示层只能由真实状态单向刷新，避免显示 Buff 清理/重建时误清业务层数"
+        )
+
+    if "DEBUG(" not in text:
+        errors.append(f"{path.name} 缺少 DEBUG 排障日志，生成脚本必须在关键分支直接输出调试信息")
+
+    missing_function_comments = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not (stripped.startswith("local function ") or stripped.startswith("function INTERFACE:")):
+            continue
+        previous = "\n".join(lines[max(0, index - 3):index])
+        if not re.search(r"--.*[\u4e00-\u9fff]", previous):
+            missing_function_comments.append(stripped)
+    if missing_function_comments:
+        preview = "; ".join(missing_function_comments[:5])
+        errors.append(f"{path.name} 存在未被中文注释覆盖的函数: {preview}")
 
     return errors

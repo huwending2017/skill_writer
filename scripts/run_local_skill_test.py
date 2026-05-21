@@ -47,12 +47,15 @@ def main() -> int:
 
     smoke_test_path = ctx.tests_path("test_skill_temp.lua")
     temp_config_path = ctx.config_path("temp_skill_config.lua")
-    if not temp_config_path.exists() or not smoke_test_path.exists():
+    if ctx.payload_path is not None and ctx.payload_path.exists():
         result = compile_payload_to_artifacts(ctx)
         smoke_test_path = result.smoke_test_path
         temp_config_path = result.temp_config_path
-        print("[test] auto_compiled:", temp_config_path)
-        print("[test] auto_compiled_smoke:", smoke_test_path)
+        print("[test] refreshed_temp_config:", temp_config_path)
+        print("[test] refreshed_smoke:", smoke_test_path)
+    elif not temp_config_path.exists() or not smoke_test_path.exists():
+        print("[test-error] 缺少 payload，且本地测试产物不完整。")
+        return 1
 
     script_path = ctx.runtime_test_path
     if script_path is None:
@@ -87,16 +90,25 @@ def main() -> int:
         print("[test] local runtime validation skipped because lupa is unavailable")
         return 0
 
-    os.chdir(ctx.workspace_root)
     lua = LuaRuntime(unpack_returned_tuples=True)
     script_text = script_path.read_text(encoding="utf-8")
-    lua.execute(script_text)
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(script_path.parent)
+        lua.execute(script_text)
+    finally:
+        os.chdir(previous_cwd)
 
     if regression_paths:
         print("[test] regression files:", len(regression_paths))
     for regression_path in regression_paths:
         print("[test] regression:", regression_path)
-        lua.execute(regression_path.read_text(encoding="utf-8"))
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(regression_path.parent)
+            lua.execute(regression_path.read_text(encoding="utf-8"))
+        finally:
+            os.chdir(previous_cwd)
     print("[test] local runtime validation passed")
     return 0
 

@@ -246,6 +246,42 @@ Existing families:
 - `buff_zhanbei.lua`
 - `buff_ragsa_hannu_state.lua`
 
+Extra note:
+
+- when the requirement combines "self large-hit threshold", "ally share transfer", and "lost-stack follow-up" in one ordered runtime, check whether one resident bundle listener should own `BUFF_ATTACKED_DAMAGE` together with `BUFF_ATTACKED_SHARE` and `BUFF_LOSE_LIFE`; `buff_yuefei_jingzhong.lua` is the reference for this combined shape
+- if a linked skill only says "each current stack further reduces received damage", prefer a provider state consumed by that canonical listener when transferred damage via `change_hp(...)` must also be reduced, instead of assuming `buff_add_attr.lua` alone will cover every entrance
+
+## `BUFF_ATTACKED_SHARE`
+
+Typical purpose:
+
+- intercept ally damage before final hp loss
+- cache redirected/share amounts for a later owner-side transfer
+
+Existing families:
+
+- `buff_share.lua`
+- `buff_share_for_target.lua`
+- `buff_guard.lua`
+- `buff_yuefei_jingzhong.lua`
+
+Extra note:
+
+- if the owner should only really lose hp after the protected ally confirms hp loss, pair this event with `BUFF_LOSE_LIFE` instead of directly calling `change_hp(...)` here
+
+## `BUFF_LOSE_LIFE`
+
+Typical purpose:
+
+- react after the target really loses hp
+- convert a previously cached share amount into owner-side hp change
+
+Existing families:
+
+- `buff_share.lua`
+- `buff_share_for_target.lua`
+- `buff_yuefei_jingzhong.lua`
+
 ## `BUFF_CURE_EFFECT`
 
 Typical purpose:

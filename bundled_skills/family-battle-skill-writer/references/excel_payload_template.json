@@ -75,7 +75,6 @@
     ],
     "war_paper": [
       {
-        "ID": 903521,
         "name": "skill_dice_52321",
         "type": 4,
         "desc1": "%s投掷【命运骰子】，点数为：%s",

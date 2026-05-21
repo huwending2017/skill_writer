@@ -43,13 +43,17 @@ TEMPLATE_TEXT: Dict[str, str] = {
 5. 临时产物放到 temp_skill_workspace 子目录，并且后续续接必须沿用同一目录
 6. 给出临时 skill / stage / buff / war_paper 配置；若技能描述写了“最大等级为 n / 满级 n / n 级”，skill、skill_stage、buff 必须生成 0-n 共 n+1 条；未写最大等级时默认补齐 0-10 级
 7. skill_stage 主键必须使用 技能id_阶段_等级；buff 主键必须使用 buff_id_等级
-8. 生成需要的生产脚本，且脚本必须带详尽中文注释：文件头、参数含义、事件时机、状态读写、关键分支、异常保护、伤害/治疗/战报插入都要说明，不能只有少量标题注释
-9. 生产 Lua 必须自洽，不能依赖 test_skill_temp.lua、temp_skill_workspace、roll_skill_dice 或任何测试专用 helper
-10. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
-11. 对层数、指挥失效/恢复、清零但属性保留、驱散、死亡目标、首次/后续触发、战报展示值与内部值分离等机制，在 tests/ 下补充 regression_*.lua 或 mechanism_*.lua 回归测试
-12. 生成 temp_excel_payload.json，便于后续写回 Excel
-11. 给出测试步骤、预期触发链路、预期战报结果
-12. 如果技能描述里包含多个互不关联的技能，请作为“独立技能批量开发”处理：先拆成多个独立工作单元；在实现环境支持并行时，复用审计、脚本编写、单技能测试可以按技能并行推进；不要构造跨技能依赖图，不要让一个技能依赖另一个技能的状态；最后再统一合并到同一个 batch 临时目录、同一个 temp_excel_payload.json，并做一次汇总校验与回写预览
+8. 生成需要的生产脚本，且脚本必须带详尽中文注释：文件头、参数含义、事件时机、状态读写、关键分支、异常保护、伤害/治疗/战报插入都要说明，不能只有少量标题注释；每个非平凡 local function / INTERFACE 方法前都要有中文注释；函数内部关键 if/return、层数变化、缓存读写、监听注册、临时失效恢复、战报清理、伤害改写和 provider 状态消费处也必须就地写中文注释
+8.1 新增或实质修改的生产脚本必须在真实逻辑行直接调用 DEBUG("[技能名]", ...) 排障日志，禁止封装 debug_log 包装函数，保证战斗日志行号指向实际分支；日志覆盖 init/uninit、事件分流、概率/阈值判定、状态变化、层数变化、目标数量、伤害/治疗值、战报 ID 和关键提前 return
+9. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+9.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
+9.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
+10. 生产 Lua 必须自洽，不能依赖 test_skill_temp.lua、temp_skill_workspace、roll_skill_dice 或任何测试专用 helper
+11. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
+12. 对层数、指挥失效/恢复、清零但属性保留、驱散、死亡目标、首次/后续触发、战报展示值与内部值分离等机制，在 tests/ 下补充 regression_*.lua 或 mechanism_*.lua 回归测试
+13. 生成 temp_excel_payload.json，便于后续写回 Excel
+14. 给出测试步骤、预期触发链路、预期战报结果
+15. 如果技能描述里包含多个互不关联的技能，请作为“独立技能批量开发”处理：先拆成多个独立工作单元；在实现环境支持并行时，复用审计、脚本编写、单技能测试可以按技能并行推进；不要构造跨技能依赖图，不要让一个技能依赖另一个技能的状态；最后再统一合并到同一个 batch 临时目录、同一个 temp_excel_payload.json，并做一次汇总校验与回写预览
 
 额外约束：
 {additional_constraints}
@@ -76,11 +80,15 @@ TEMPLATE_TEXT: Dict[str, str] = {
 7. 临时产物统一放到 temp_skill_workspace/<bundle_name>/ 下，后续续接必须沿用同一目录
 8. 给出 bundle 级临时配置、脚本、测试方案；若技能描述写了“最大等级为 n / 满级 n / n 级”，skill、skill_stage、buff 必须生成 0-n 共 n+1 条；未写最大等级时默认补齐 0-10 级
 9. skill_stage 主键必须使用 技能id_阶段_等级；buff 主键必须使用 buff_id_等级
-10. 新增生产脚本必须带详尽中文注释：文件头、参数含义、事件时机、状态读写、关键分支、异常保护、伤害/治疗/战报插入都要说明；同时必须自洽，不能依赖测试文件或测试专用 helper
-11. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
-12. 对层数、指挥失效/恢复、清零但属性保留、驱散、死亡目标、首次/后续触发、战报展示值与内部值分离等机制，在 tests/ 下补充 regression_*.lua 或 mechanism_*.lua 回归测试
-13. 生成 temp_excel_payload.json，便于后续写回 Excel
-12. 说明每个技能的触发顺序、异常情况、战报展示
+10. 新增生产脚本必须带详尽中文注释：文件头、参数含义、事件时机、状态读写、关键分支、异常保护、伤害/治疗/战报插入都要说明；每个非平凡 local function / INTERFACE 方法前都要有中文注释；函数内部关键 if/return、层数变化、缓存读写、监听注册、临时失效恢复、战报清理、伤害改写和 provider 状态消费处也必须就地写中文注释；同时必须自洽，不能依赖测试文件或测试专用 helper
+10.1 新增或实质修改的生产脚本必须在真实逻辑行直接调用 DEBUG("[技能名]", ...) 排障日志，禁止封装 debug_log 包装函数，保证战斗日志行号指向实际分支；日志覆盖 init/uninit、事件分流、概率/阈值判定、状态变化、层数变化、目标数量、伤害/治疗值、战报 ID 和关键提前 return
+11. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+11.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
+11.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
+12. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
+13. 对层数、指挥失效/恢复、清零但属性保留、驱散、死亡目标、首次/后续触发、战报展示值与内部值分离等机制，在 tests/ 下补充 regression_*.lua 或 mechanism_*.lua 回归测试
+14. 生成 temp_excel_payload.json，便于后续写回 Excel
+15. 说明每个技能的触发顺序、异常情况、战报展示
 
 额外约束：
 {additional_constraints}
@@ -107,8 +115,11 @@ TEMPLATE_TEXT: Dict[str, str] = {
 7. 产物继续放在旧任务目录，或放到 temp_skill_workspace/<旧技能名>_iteration_<short_topic>，并说明为什么选择该目录
 8. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
 9. 更新 temp_excel_payload.json：包含新增技能配置、被迭代旧技能受影响的配置行，以及必要的 war_paper 行；未变化的旧配置不要无意义重写
+9.0 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+9.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
+9.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
 9.1 对新旧行为差异补充 tests/regression_*.lua 或 tests/mechanism_*.lua 回归测试，至少覆盖旧逻辑不变和新机制生效两类场景
-9. 新增或修改的生产 Lua 必须带详尽中文注释，特别说明兼容旧逻辑、新机制入口、状态读写、失效恢复、战报和统计
+9. 新增或修改的生产 Lua 必须带详尽中文注释，特别说明兼容旧逻辑、新机制入口、状态读写、失效恢复、战报和统计；每个非平凡 local function / INTERFACE 方法前都要有中文注释；函数内部关键 if/return、层数变化、缓存读写、监听注册、临时失效恢复、战报清理、伤害改写和 provider 状态消费处也必须就地写中文注释；并在真实逻辑行直接补 DEBUG("[技能名]", ...) 排障日志，禁止 debug_log 包装函数
 10. 给出回归测试：旧技能无新机制时行为不变；新机制存在时行为按新规则变化；同时覆盖失效、移除、叠层、死亡、空目标等风险
 
 额外约束：
@@ -124,12 +135,15 @@ TEMPLATE_TEXT: Dict[str, str] = {
 2. 能复用就不要新增脚本；必须新增时说明原因
 3. 简单静态属性/伤害修正优先用 buff_add_attr.lua / buff_add_attr_p.lua 配置，不要直接新增伤害监听脚本
 4. 临时文件放到 temp_skill_workspace，续接时沿用同一任务目录
-5. 输出配置、脚本、测试；新增生产脚本必须带详尽中文注释，覆盖参数、事件、状态、关键分支、异常保护和战报插入
+5. 输出配置、脚本、测试；新增生产脚本必须带详尽中文注释，覆盖参数、事件、状态、关键分支、异常保护和战报插入；每个非平凡 local function / INTERFACE 方法前都要有中文注释；函数内部关键 if/return、层数变化、缓存读写、监听注册、临时失效恢复、战报清理、伤害改写和 provider 状态消费处也必须就地写中文注释；并在真实逻辑行直接补 DEBUG("[技能名]", ...) 排障日志，禁止 debug_log 包装函数
 6. 若技能描述写了“最大等级为 n / 满级 n / n 级”，skill、skill_stage、buff 必须生成 0-n 共 n+1 条；未写最大等级时默认补齐 0-10 级；skill_stage 主键使用 技能id_阶段_等级
 7. 生产 Lua 必须自洽，不能依赖 test_skill_temp.lua 或测试专用 helper
 8. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
-9. 对层数、指挥失效/恢复、清零但属性保留、驱散、死亡目标、首次/后续触发、战报展示值与内部值分离等机制，在 tests/ 下补充 regression_*.lua 或 mechanism_*.lua 回归测试
-10. 生成 temp_excel_payload.json，便于后续写回 Excel
+9. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+9.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
+9.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
+10. 对层数、指挥失效/恢复、清零但属性保留、驱散、死亡目标、首次/后续触发、战报展示值与内部值分离等机制，在 tests/ 下补充 regression_*.lua 或 mechanism_*.lua 回归测试
+11. 生成 temp_excel_payload.json，便于后续写回 Excel
 
 保护文件：
 {protected_files}
@@ -152,7 +166,29 @@ def build_prompt(
         protected_files=protected_files.strip() or "无",
         additional_constraints=additional_constraints.strip() or "无",
     )
-    return prompt.rstrip() + "\n\n" + build_level_rule_hint(skill_description)
+    return (
+        prompt.rstrip()
+        + "\n\n"
+        + build_level_rule_hint(skill_description)
+        + "\n\n"
+        + build_battle_report_rule_hint()
+        + "\n\n"
+        + build_excel_config_format_rule()
+    )
+
+
+def build_battle_report_rule_hint() -> str:
+    return "\n".join(
+        [
+            "战报覆盖硬性规则：",
+            "1. 战报是技能机制契约，不是附加装饰；实现前必须在 docs/IMPLEMENTATION.md 写“战报覆盖矩阵”。",
+            "2. 覆盖矩阵至少包含：触发入口、成功/失败/无目标、层数增加/减少/转换/当前值、伤害/治疗/减免/分摊、状态添加/消失/临时失效/恢复、首次阈值/后续触发、战报插入时机、war_paper name、num_list 参数顺序。",
+            "3. 玩家需要理解的机制变化必须有战报或明确复用已有战报：例如失去/获得层数、每层属性/倒戈/减伤收益、驱散尝试/成功/无可驱散目标、首次达到阈值、状态开始和结束。",
+            "4. resident buff 或事件触发 Buff 响应其他技能/伤害事件时，不能只 make_effect_records；必须通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回当前战报。",
+            "5. 战报顺序必须贴近实际触发顺序；例如受到伤害时应按减伤说明、实际伤害、层数变化、层数转换、追加攻击/驱散/状态的顺序展示，不能无故延迟到回合结束。",
+            "6. 百分比参数使用 RECORD_NUM_DEF.PERCENT_TYPE；war_paper 文本占位符与 Lua num_list 顺序必须一一对应。",
+        ]
+    )
 
 
 def template_labels() -> list[str]:
@@ -167,6 +203,18 @@ def template_key_from_label(value: str) -> str:
     if value in TEMPLATE_TEXT:
         return value
     return TEMPLATE_KEYS_BY_LABEL.get(value, "single")
+
+
+def build_excel_config_format_rule() -> str:
+    return "\n".join(
+        [
+            "Excel 配置字段格式硬性规则：",
+            "1. temp_excel_payload.json 里会写入 Excel 的字段，禁止输出 JSON/Python/Lua table 字面量。",
+            "2. 禁止示例：['ATK',10000]、[\"ATK\",10000]、{ATK=10000}、{\"attr\":\"ATK\"}。",
+            "3. 一维配置必须写成逗号串：ATK,10000；多组配置必须写成管道分组：ATK,10000|DEF,5000。",
+            "4. 属性枚举、目标枚举、事件枚举在 Excel 参数串里不加引号，不带方括号；正式 Lua 导表必须能直接按现有脚本解析。",
+        ]
+    )
 
 
 def build_level_rule_hint(skill_description: str) -> str:

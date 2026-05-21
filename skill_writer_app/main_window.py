@@ -55,6 +55,48 @@ class SkillWriterApp:
     LOG_FLUSH_INTERVAL_MS = 1000
     LOG_MAX_LINES = 5000
     STATUS_TICK_MS = 1000
+    CORE_LOG_PREFIXES = (
+        "[session]",
+        "[workflow]",
+        "[workflow-resume]",
+        "[workflow-guard]",
+        "[health]",
+        "[task]",
+        "[serial]",
+        "[handoff]",
+        "[repair]",
+        "[local-python]",
+        "[local-script]",
+        "[local-error]",
+        "[audit]",
+        "[audit-error]",
+        "[compile]",
+        "[compile-error]",
+        "[test]",
+        "[test-error]",
+        "[writeback-mode]",
+        "[writeback-progress]",
+        "[writeback-error]",
+        "[summary]",
+        "[timing]",
+        "[finalize]",
+        "[archive]",
+        "[python-deps]",
+        "[codex-error]",
+        "[claude-error]",
+        "[log-ui]",
+    )
+    CORE_LOG_CONTAINS = (
+        "Traceback",
+        "Error",
+        "Exception",
+        "ModuleNotFoundError",
+        "退出码",
+        "执行失败",
+        "不可执行",
+        "passed",
+        "failed",
+    )
     REPAIR_TEXT_SUFFIXES = {".txt", ".log", ".md", ".json", ".lua", ".csv"}
     REPAIR_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
     SKILL_EXCEL_NAME = "J_技能表_skill.xlsx"
@@ -1757,6 +1799,7 @@ class SkillWriterApp:
 
         if selected_task_dir:
             self.set_task_local_excel_dirs(selected_task_dir)
+            self.load_task_context_into_editor(selected_task_dir)
         self.refresh_current_task_artifacts()
         self.update_action_buttons()
 
@@ -1927,6 +1970,14 @@ class SkillWriterApp:
     def load_task_context_into_editor(self, task_dir: str) -> None:
         context = self.load_task_context(task_dir)
         if not context:
+            self.suppress_requirement_change = True
+            try:
+                self.description_text.delete("1.0", "end")
+                self.refresh_prompt()
+                self.accept_current_requirement_context()
+                self.append_log(f"[workflow-resume] 任务目录没有保存技能描述，已清空描述框: {task_dir}")
+            finally:
+                self.suppress_requirement_change = False
             return
         changed = False
         self.suppress_requirement_change = True
@@ -1934,6 +1985,9 @@ class SkillWriterApp:
             if context.get("requirement"):
                 self.description_text.delete("1.0", "end")
                 self.description_text.insert("1.0", context["requirement"])
+                changed = True
+            else:
+                self.description_text.delete("1.0", "end")
                 changed = True
             if context.get("constraints"):
                 self.constraints_text.delete("1.0", "end")
@@ -2037,6 +2091,24 @@ class SkillWriterApp:
             return
         self.reset_current_task_selection_for_new_requirement()
 
+    def sync_changed_requirement_to_current_task(self) -> bool:
+        if not self.has_requirement_changed():
+            return False
+        target_key = self.current_target_key()
+        task_dir = self.latest_task_dir_var.get().strip()
+        if not target_key or not task_dir or not Path(task_dir).exists():
+            self.detach_old_artifacts_for_new_requirement()
+            self.accept_current_requirement_context()
+            return True
+
+        self.stop_serial_workflow("检测到技能描述变更，已重置当前任务到开发步骤。")
+        self.active_task_service.clear(target_key)
+        self.workflow_state_service.set(target_key, "develop")
+        self.write_task_handoff(status="requirement_changed", current_step="", next_step="develop")
+        self.accept_current_requirement_context()
+        self.append_log(f"[workflow] 已同步修改后的技能描述到当前任务: {task_dir}")
+        return True
+
     def reset_current_task_selection_for_new_requirement(self) -> None:
         workspace_root = self.workspace_var.get().strip()
         self.latest_task_dir_var.set("")
@@ -2083,6 +2155,7 @@ class SkillWriterApp:
         self.set_task_local_excel_dirs(str(task_dir))
         self.refresh_current_task_artifacts()
         self.accept_current_requirement_context()
+        self.write_task_handoff(status="pending", current_step="", next_step="develop")
         self.status_var.set("已确认新技能开发")
         self.set_task_stage("等待开发")
         self.append_log(f"[workflow] 已新建技能任务：{task_dir}")
@@ -2462,6 +2535,21 @@ class SkillWriterApp:
                 failed += 1
                 self.append_log(f"[workflow-cleanup] failed: {path} :: {exc}")
         return removed, failed
+
+    def mark_downstream_steps_dirty_after_develop(self) -> None:
+        target_key = self.current_target_key()
+        if not target_key:
+            return
+        cleanup_paths = self.collect_workflow_reset_cleanup_paths("audit")
+        removed, failed = self.remove_workflow_reset_artifacts(cleanup_paths)
+        self.workflow_state_service.set(target_key, "audit")
+        self.active_task_service.clear(target_key)
+        if cleanup_paths:
+            self.append_log(
+                f"[workflow] 开发/续写已更新产物，后续步骤将从“本地预审”重新执行；旧副本/预览产物清理 {removed} 个，失败 {failed} 个。"
+            )
+        else:
+            self.append_log("[workflow] 开发/续写已更新产物，后续步骤将从“本地预审”重新执行。")
 
     def toggle_step_overview(self) -> None:
         self.step_overview_visible = not self.step_overview_visible
@@ -3128,12 +3216,33 @@ class SkillWriterApp:
             messagebox.showwarning("提示", "当前没有可打开的 payload 文件")
             return
         if not path.exists():
-            messagebox.showwarning("提示", "payload 文件不存在")
+            messagebox.showwarning("提示", f"payload 文件不存在:\n{path}")
             return
+        self.open_file_with_fallback(path)
+
+    def open_file_with_fallback(self, path: Path) -> None:
         try:
             os.startfile(str(path))
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("错误", str(exc))
+            return
+        except Exception as start_error:  # noqa: BLE001
+            if path.suffix.lower() in {".json", ".log", ".txt", ".md", ".lua", ".csv"}:
+                try:
+                    subprocess.Popen(["notepad.exe", str(path)], **self.hidden_subprocess_kwargs())
+                    return
+                except Exception as fallback_error:  # noqa: BLE001
+                    messagebox.showerror("错误", f"无法打开文件:\n{path}\n\n{fallback_error}")
+                    return
+            messagebox.showerror("错误", f"无法打开文件:\n{path}\n\n{start_error}")
+
+    def hidden_subprocess_kwargs(self) -> dict:
+        if os.name != "nt":
+            return {}
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        return {
+            "startupinfo": startupinfo,
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+        }
 
     def open_selected_task_dir(self, listbox: tk.Listbox | None = None) -> None:
         path = self.get_selected_task_dir(listbox)
@@ -3175,10 +3284,7 @@ class SkillWriterApp:
         if not path.exists():
             messagebox.showwarning("提示", "产物文件不存在")
             return
-        try:
-            os.startfile(str(path))
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("错误", str(exc))
+        self.open_file_with_fallback(path)
 
     def open_selected_artifact_parent(self) -> None:
         path = self.get_selected_artifact()
@@ -4360,13 +4466,38 @@ class SkillWriterApp:
     def append_log(self, text: str) -> None:
         self.last_log_at = datetime.now()
         self.last_log_time_var.set(self.last_log_at.strftime("%H:%M:%S"))
-        self.write_full_log(text if text.endswith("\n") else text + "\n")
-        self.log_text.insert("end", text)
-        if not text.endswith("\n"):
+        full_text = self.timestamp_log_text(text)
+        self.write_full_log(full_text if full_text.endswith("\n") else full_text + "\n")
+        visible_text = self.visible_log_text(text)
+        if not visible_text:
+            return
+        self.log_text.insert("end", visible_text)
+        if not visible_text.endswith("\n"):
             self.log_text.insert("end", "\n")
         self.trim_log_if_needed()
         self.log_text.see("end")
-        self.append_workbench_log(text)
+        self.append_workbench_log(visible_text)
+
+    def timestamp_log_text(self, text: str) -> str:
+        stamp = datetime.now().strftime("[%H:%M:%S]")
+        lines = text.splitlines()
+        if not lines:
+            return stamp
+        return "\n".join(f"{stamp} {line}" if line else stamp for line in lines)
+
+    def visible_log_text(self, text: str) -> str:
+        visible = [line for line in text.splitlines() if self.is_core_log_line(line)]
+        if not visible:
+            return ""
+        return self.timestamp_log_text("\n".join(visible))
+
+    def is_core_log_line(self, line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return False
+        if stripped.startswith(self.CORE_LOG_PREFIXES):
+            return True
+        return any(token in stripped for token in self.CORE_LOG_CONTAINS)
 
     def append_workbench_log(self, text: str) -> None:
         if not hasattr(self, "workbench_log_text"):
@@ -4638,8 +4769,7 @@ class SkillWriterApp:
             messagebox.showerror("错误", "Prompt 不能为空")
             return
         if state.get("requirement_changed"):
-            self.detach_old_artifacts_for_new_requirement()
-            self.accept_current_requirement_context()
+            self.sync_changed_requirement_to_current_task()
         resume_match = self.find_resumable_develop_task(prompt)
         resume_key = ""
         resume_session_id = ""
@@ -4883,6 +5013,8 @@ class SkillWriterApp:
             self.last_task_error_message = self.writeback_service.last_error_message
         if code == 0 and self.task_name_to_step(task_name) == "real":
             self.current_archive_dir = self.archive_current_task()
+        if code == 0 and self.task_name_to_step(task_name) == "develop":
+            self.mark_downstream_steps_dirty_after_develop()
         history_entry = self.build_history_entry(task_name, code)
         self.history_entries = self.history_service.append(history_entry)
         self.refresh_history_view()
