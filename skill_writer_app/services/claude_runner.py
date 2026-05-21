@@ -5,8 +5,9 @@ import os
 import shlex
 import subprocess
 import threading
+import time
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import Callable, List, Optional
 
 from skill_writer_app.services.claude_locator import resolve_claude_executable
@@ -54,6 +55,14 @@ class ClaudeRunner:
         self.last_resolved_executable = resolve_claude_executable(preferred_path)
         return self.last_resolved_executable
 
+    def _short_json(self, value: object, limit: int = 260) -> str:
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except TypeError:
+            text = str(value)
+        text = " ".join(text.split())
+        return text if len(text) <= limit else text[:limit] + "..."
+
     def build_command(
         self,
         workspace_root: str,
@@ -67,10 +76,9 @@ class ClaudeRunner:
         command: List[str] = [
             claude_executable,
             "-p",
+            "--verbose",
             "--output-format",
             "stream-json",
-            "--cwd",
-            workspace_root,
             "--dangerously-skip-permissions",
         ]
         if model.strip():
@@ -125,16 +133,46 @@ class ClaudeRunner:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     bufsize=0,
+                    cwd=workspace_root,
                     env=self._subprocess_env(),
                     **self._windows_subprocess_kwargs(),
                 )
 
                 assert self.process.stdin is not None
-                self.process.stdin.write(prompt.encode("utf-8"))
-                self.process.stdin.close()
+                prompt_input = prompt if prompt.endswith("\n") else prompt + "\n"
+                try:
+                    self.process.stdin.write(prompt_input.encode("utf-8"))
+                    self.process.stdin.flush()
+                    self.process.stdin.close()
+                except BrokenPipeError as exc:
+                    raise RuntimeError(
+                        "Claude CLI 提前退出，未接收任务内容；通常是 Claude 参数、认证或本机 CLI 环境异常。"
+                    ) from exc
 
                 assert self.process.stdout is not None
-                for raw_line in self.process.stdout:
+                stream_queue: Queue[Optional[bytes]] = Queue()
+
+                def read_stdout() -> None:
+                    assert self.process is not None and self.process.stdout is not None
+                    for stdout_line in self.process.stdout:
+                        stream_queue.put(stdout_line)
+                    stream_queue.put(None)
+
+                threading.Thread(target=read_stdout, daemon=True).start()
+                last_output_at = time.monotonic()
+                while True:
+                    try:
+                        raw_line = stream_queue.get(timeout=30)
+                    except Empty:
+                        if self.process is not None and self.process.poll() is None:
+                            idle_seconds = int(time.monotonic() - last_output_at)
+                            log_queue.put(f"[claude-heartbeat] Claude 仍在运行，已 {idle_seconds} 秒无新输出。")
+                            continue
+                        break
+                    if raw_line is None:
+                        break
+
+                    last_output_at = time.monotonic()
                     output_line = decode_process_output(raw_line).rstrip("\r\n")
                     try:
                         payload = json.loads(output_line)
@@ -149,13 +187,31 @@ class ClaudeRunner:
                         if on_session_detected:
                             on_session_detected(session_id, "")
 
-                    if payload.get("type") == "assistant":
+                    payload_type = payload.get("type")
+                    if payload_type == "system" and payload.get("subtype") == "init":
+                        cwd = str(payload.get("cwd", "") or "")
+                        active_model = str(payload.get("model", "") or "")
+                        log_queue.put(f"[claude-init] cwd={cwd} model={active_model}")
+                    elif payload_type == "assistant":
                         content = payload.get("message", {}).get("content", [])
                         for block in content if isinstance(content, list) else []:
                             if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
                                 log_queue.put(str(block["text"]))
-                    elif payload.get("type") == "result":
+                            elif isinstance(block, dict) and block.get("type") == "tool_use":
+                                tool_name = str(block.get("name", "") or "")
+                                tool_input = self._short_json(block.get("input", {}))
+                                log_queue.put(f"[claude-tool] {tool_name} {tool_input}")
+                    elif payload_type == "user":
+                        content = payload.get("message", {}).get("content", [])
+                        for block in content if isinstance(content, list) else []:
+                            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                                continue
+                            if block.get("is_error"):
+                                log_queue.put(f"[claude-tool-error] {self._short_json(block.get('content', ''))}")
+                    elif payload_type == "result":
                         final_result = str(payload.get("result", "") or "")
+                        if payload.get("is_error"):
+                            log_queue.put(f"[claude-result-error] {final_result or payload.get('subtype', '')}")
                         if final_result:
                             log_queue.put(final_result)
 

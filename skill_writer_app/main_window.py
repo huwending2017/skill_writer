@@ -5004,9 +5004,11 @@ class SkillWriterApp:
         remaining_safe_lines = self.log_sanitizer.flush()
         if remaining_safe_lines:
             self.append_log("\n".join(remaining_safe_lines) + "\n")
-        self.refresh_temp_workspace_views(force_latest=self.task_name_to_step(task_name) == "develop")
+        self.refresh_temp_workspace_views(force_latest=code == 0 and self.task_name_to_step(task_name) == "develop")
         if self.codex_runner.last_error_message:
             self.last_task_error_message = self.codex_runner.last_error_message
+        elif self.claude_runner.last_error_message:
+            self.last_task_error_message = self.claude_runner.last_error_message
         elif self.local_script_runner.last_error_message:
             self.last_task_error_message = self.local_script_runner.last_error_message
         elif self.writeback_service.last_error_message:
