@@ -324,7 +324,9 @@ class SkillWriterApp:
     def bundled_script_path(self, script_name: str) -> Path:
         candidates = [
             self.base_dir / "scripts" / script_name,
+            self.base_dir.parent / "scripts" / script_name,
             self.base_dir / "_internal" / "scripts" / script_name,
+            self.base_dir / "_internal" / ".." / "scripts" / script_name,
         ]
         for candidate in candidates:
             if candidate.exists():
@@ -4186,6 +4188,13 @@ class SkillWriterApp:
             f"{attachment_section}\n\n"
             "如果附件里包含图片，请优先查看图片内容；如果当前模型/运行环境无法直接读取图片，"
             "请根据用户文字说明和附件文件名继续定位，并在结果里说明图片未能直接解析。\n\n"
+            "过程输出要求:\n"
+            "1. 开始后先输出“开始定位”，说明会检查哪些目录、配置、脚本或日志。\n"
+            "2. 每完成一个关键阶段都要输出简短中文进度，例如“已定位到疑似配置问题/脚本问题/战报问题”。\n"
+            "3. 如果读取了关键文件或命中关键函数，要说明文件路径和判断依据，但不要整段粘贴源码。\n"
+            "4. 如果进行了修改，必须说明改了哪些文件、为什么改、对原技能流程有什么影响。\n"
+            "5. 结束时必须给出“修复总结”，包含：问题原因、修改文件、关键改动、验证结果、仍需人工确认的风险。\n"
+            "6. 不要只输出一句完成，也不要静默长时间分析；长任务至少阶段性汇报当前正在做什么。\n\n"
             "原始技能需求:\n"
             f"{entry.skill_description or '未记录'}\n\n"
             "原始额外约束:\n"

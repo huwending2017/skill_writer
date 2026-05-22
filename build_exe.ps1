@@ -120,6 +120,31 @@ if (-not $buildSucceeded) {
     throw "Build failed after $maxBuildAttempts attempts"
 }
 
+function Copy-RuntimeAssets {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath
+    )
+
+    $runtimeDirs = @("scripts", "bundled_skills")
+    foreach ($relative in $runtimeDirs) {
+        $source = Join-Path $RootPath $relative
+        if (-not (Test-Path -LiteralPath $source)) {
+            continue
+        }
+        $target = Join-Path $TargetPath $relative
+        if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+        Copy-Item -LiteralPath $source -Destination $target -Recurse -Force
+    }
+
+    $dataLogs = Join-Path $TargetPath "data\logs"
+    New-Item -ItemType Directory -Force -Path $dataLogs | Out-Null
+}
+
 $exePath = Join-Path $projectRoot "dist\SkillWriterDesktop\SkillWriterDesktop.exe"
 $launcherBat = Join-Path $projectRoot "dist\SkillWriterDesktop\start_skill_writer_desktop.bat"
 @"
@@ -173,6 +198,7 @@ if (-not $portableSucceeded) {
 
 $portableExePath = Join-Path $projectRoot "dist\SkillWriterDesktopPortable.exe"
 Copy-Item -LiteralPath "$projectRoot\dist_onefile\SkillWriterDesktopPortable.exe" -Destination $portableExePath -Force
+Copy-RuntimeAssets -RootPath $projectRoot -TargetPath (Join-Path $projectRoot "dist")
 
 Remove-PythonSourceCaches -RootPath $projectRoot
 Remove-PathWithRetry -TargetPath "$projectRoot\build"

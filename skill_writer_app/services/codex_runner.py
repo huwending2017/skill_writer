@@ -8,7 +8,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from typing import Callable, List, Optional, Sequence
 
 from skill_writer_app.services.codex_locator import resolve_codex_executable
@@ -306,8 +306,30 @@ class CodexRunner:
                     time.sleep(0.3)
 
                 assert self.process.stdout is not None
-                for line in self.process.stdout:
-                    output_line = decode_process_output(line).rstrip("\r\n")
+                stream_queue: Queue[Optional[bytes]] = Queue()
+
+                def read_stdout() -> None:
+                    assert self.process is not None and self.process.stdout is not None
+                    for stdout_line in self.process.stdout:
+                        stream_queue.put(stdout_line)
+                    stream_queue.put(None)
+
+                threading.Thread(target=read_stdout, daemon=True).start()
+                last_output_at = time.monotonic()
+                while True:
+                    try:
+                        raw_line = stream_queue.get(timeout=30)
+                    except Empty:
+                        if self.process is not None and self.process.poll() is None:
+                            idle_seconds = int(time.monotonic() - last_output_at)
+                            log_queue.put(f"[codex-heartbeat] Codex 仍在运行，已 {idle_seconds} 秒无新输出。")
+                            continue
+                        break
+                    if raw_line is None:
+                        break
+
+                    last_output_at = time.monotonic()
+                    output_line = decode_process_output(raw_line).rstrip("\r\n")
                     if not detected_session_id:
                         detected_session_id, session_file = self.find_latest_session_for_workspace(
                             workspace_root,

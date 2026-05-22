@@ -45,6 +45,37 @@ function Remove-PythonCaches {
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
 }
 
+function Copy-RuntimeAssets {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RootPath,
+        [Parameter(Mandatory = $true)]
+        [string]$TargetPath
+    )
+
+    $runtimeDirs = @("scripts", "bundled_skills")
+    foreach ($relative in $runtimeDirs) {
+        $source = Join-Path $RootPath $relative
+        if (-not (Test-Path -LiteralPath $source)) {
+            continue
+        }
+        $target = Join-Path $TargetPath $relative
+        if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
+        Copy-Item -LiteralPath $source -Destination $target -Recurse -Force
+    }
+
+    foreach ($relative in @("README.md", "clean_workspace.bat", "clean_workspace.ps1")) {
+        $source = Join-Path $RootPath $relative
+        if (Test-Path -LiteralPath $source) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $TargetPath $relative) -Force
+        }
+    }
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $TargetPath "data\logs") | Out-Null
+}
+
 function New-ReleaseManifest {
     param(
         [Parameter(Mandatory = $true)]
@@ -89,6 +120,11 @@ $releaseDir = Join-Path $projectRoot "release"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $zipName = "SkillWriterDesktop_$timestamp.zip"
 $zipPath = Join-Path $releaseDir $zipName
+$releaseBuildDir = Join-Path $releaseDir "_build_$timestamp"
+$releaseBuildDist = Join-Path $releaseBuildDir "dist"
+$releaseBuildWork = Join-Path $releaseBuildDir "build"
+$releasePortableDist = Join-Path $releaseBuildDir "dist_onefile"
+$releasePortableWork = Join-Path $releaseBuildDir "build_onefile"
 $stageDir = Join-Path $releaseDir "_stage_$timestamp"
 $stageAppDir = Join-Path $stageDir "SkillWriterDesktop"
 $manifestPath = Join-Path $stageDir "RELEASE_NOTES.txt"
@@ -96,19 +132,38 @@ $manifestPath = Join-Path $stageDir "RELEASE_NOTES.txt"
 Write-Host "[release] project root: $projectRoot"
 
 if (-not $SkipBuild) {
-    Write-Host "[release] building application"
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot "build_exe.ps1")
+    Write-Host "[release] syncing bundled Codex skills"
+    python -B (Join-Path $projectRoot "scripts\sync_bundled_skills.py")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to sync bundled Codex skills"
+    }
+
+    python -B -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[release] PyInstaller not found, installing from requirements-build.txt"
+        python -m pip install -r (Join-Path $projectRoot "requirements-build.txt")
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install build dependencies"
+        }
+    }
+
+    Remove-PathWithRetry -TargetPath $releaseBuildDir
+    New-Item -ItemType Directory -Force -Path $releaseBuildDir | Out-Null
+
+    Write-Host "[release] building folder application in isolated release directory"
+    python -B -m PyInstaller --noconfirm --clean --distpath $releaseBuildDist --workpath $releaseBuildWork (Join-Path $projectRoot "SkillWriterDesktop.spec")
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed"
     }
+    $appDir = Join-Path $releaseBuildDist "SkillWriterDesktop"
+    $exePath = Join-Path $appDir "SkillWriterDesktop.exe"
 
-    Write-Host "[release] building single-file portable exe"
-    Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build_onefile")
-    Remove-PathWithRetry -TargetPath $portableDist
-    python -B -m PyInstaller --noconfirm --clean --distpath $portableDist --workpath (Join-Path $projectRoot "build_onefile") (Join-Path $projectRoot "SkillWriterDesktopPortable.spec")
+    Write-Host "[release] building single-file portable exe in isolated release directory"
+    python -B -m PyInstaller --noconfirm --clean --distpath $releasePortableDist --workpath $releasePortableWork (Join-Path $projectRoot "SkillWriterDesktopPortable.spec")
     if ($LASTEXITCODE -ne 0) {
         throw "Portable build failed"
     }
+    $portableExePath = Join-Path $releasePortableDist "SkillWriterDesktopPortable.exe"
 } else {
     Write-Host "[release] skip build requested"
 }
@@ -130,6 +185,7 @@ Remove-PathWithRetry -TargetPath $stageDir
 New-Item -ItemType Directory -Path $stageDir | Out-Null
 Copy-Item -LiteralPath $appDir -Destination $stageAppDir -Recurse -Force
 Copy-Item -LiteralPath $portableExePath -Destination (Join-Path $stageDir "SkillWriterDesktopPortable.exe") -Force
+Copy-RuntimeAssets -RootPath $projectRoot -TargetPath $stageDir
 New-ReleaseManifest -AppDir $stageAppDir -ZipName $zipName -OutputPath $manifestPath
 
 if ((Test-Path -LiteralPath $zipPath) -and -not $KeepExistingZip) {
@@ -167,6 +223,7 @@ $hashPath = "$zipPath.sha256.txt"
 Remove-PythonCaches -RootPath $projectRoot
 Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build")
 Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build_onefile")
+Remove-PathWithRetry -TargetPath $releaseBuildDir
 Remove-PathWithRetry -TargetPath $stageDir
 
 Write-Host "[release] done"
