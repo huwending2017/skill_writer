@@ -91,6 +91,9 @@ Remove-PathWithRetry -TargetPath "$projectRoot\build"
 Remove-PathWithRetry -TargetPath "$projectRoot\build_onefile"
 Remove-PathWithRetry -TargetPath "$projectRoot\dist\SkillWriterDesktop"
 Remove-PathWithRetry -TargetPath "$projectRoot\dist_onefile"
+Remove-PathWithRetry -TargetPath "$projectRoot\dist\scripts"
+Remove-PathWithRetry -TargetPath "$projectRoot\dist\bundled_skills"
+Remove-PathWithRetry -TargetPath "$projectRoot\dist\data"
 Remove-Item -LiteralPath "$projectRoot\dist\SkillWriterDesktopPortable.exe" -Force -ErrorAction SilentlyContinue
 
 $maxBuildAttempts = 3
@@ -198,7 +201,7 @@ if (-not $portableSucceeded) {
 
 $portableExePath = Join-Path $projectRoot "dist\SkillWriterDesktopPortable.exe"
 Copy-Item -LiteralPath "$projectRoot\dist_onefile\SkillWriterDesktopPortable.exe" -Destination $portableExePath -Force
-Copy-RuntimeAssets -RootPath $projectRoot -TargetPath (Join-Path $projectRoot "dist")
+Copy-RuntimeAssets -RootPath $projectRoot -TargetPath (Join-Path $projectRoot "dist\SkillWriterDesktop")
 
 Remove-PythonSourceCaches -RootPath $projectRoot
 Remove-PathWithRetry -TargetPath "$projectRoot\build"

@@ -1,6 +1,7 @@
 param(
     [switch]$SkipBuild,
-    [switch]$KeepExistingZip
+    [switch]$KeepExistingZip,
+    [int]$KeepReleaseCount = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -43,6 +44,54 @@ function Remove-PythonCaches {
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
     Get-ChildItem -LiteralPath $RootPath -Recurse -Force -File -Filter "*.pyc" -ErrorAction SilentlyContinue |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+}
+
+function Clear-TransientReleaseArtifacts {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReleaseDir
+    )
+
+    if (-not (Test-Path -LiteralPath $ReleaseDir)) {
+        return
+    }
+
+    Get-ChildItem -LiteralPath $ReleaseDir -Force -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "_build_*" -or $_.Name -like "_stage_*" -or $_.Name -like "_selftest_*" } |
+        ForEach-Object { Remove-PathWithRetry -TargetPath $_.FullName }
+}
+
+function Remove-OldReleaseOutputs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReleaseDir,
+        [int]$KeepCount = 1
+    )
+
+    if ($KeepCount -lt 1) {
+        $KeepCount = 1
+    }
+    if (-not (Test-Path -LiteralPath $ReleaseDir)) {
+        return
+    }
+
+    $zipFiles = Get-ChildItem -LiteralPath $ReleaseDir -Force -File -Filter "SkillWriterDesktop_*.zip" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    $oldZipFiles = $zipFiles | Select-Object -Skip $KeepCount
+
+    foreach ($zip in $oldZipFiles) {
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($zip.Name)
+        $siblings = @(
+            $zip.FullName,
+            "$($zip.FullName).sha256.txt",
+            (Join-Path $ReleaseDir "$baseName.selftest.txt")
+        )
+        foreach ($path in $siblings) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force
+            }
+        }
+    }
 }
 
 function Copy-RuntimeAssets {
@@ -93,18 +142,48 @@ function New-ReleaseManifest {
         "Skill Writer Desktop Release",
         "GeneratedAt: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
         "ZipName: $ZipName",
-        "FolderExe: SkillWriterDesktop\SkillWriterDesktop.exe",
+        "RecommendedLauncher: start_skill_writer_desktop.bat",
+        "PortableExe: SkillWriterDesktop.exe",
+        "RuntimeFolderExe: _runtime\SkillWriterDesktop\SkillWriterDesktop.exe",
         "FolderExeSize: $($exeItem.Length)",
-        "PortableExe: SkillWriterDesktopPortable.exe",
         "Usage:",
         "1. Unzip this package on the target Windows machine.",
-        "2. Recommended: run SkillWriterDesktopPortable.exe. It is a single-file build and avoids missing _internal files.",
-        "3. Alternative: open the SkillWriterDesktop folder and run start_skill_writer_desktop.bat.",
-        "4. Do not copy SkillWriterDesktop\SkillWriterDesktop.exe alone; it must stay beside the SkillWriterDesktop\_internal directory.",
+        "2. Recommended: double-click start_skill_writer_desktop.bat in the package root.",
+        "3. Alternative: double-click SkillWriterDesktop.exe in the package root.",
+        "4. Do not enter _runtime and copy/run the small SkillWriterDesktop.exe alone; it must stay beside _runtime\SkillWriterDesktop\_internal.",
         "5. If Windows blocks the program after transfer, right-click the zip or exe, open Properties, choose Unblock, then unzip again.",
         "6. The target machine still needs a working Codex or Claude CLI/login/API-key environment."
     )
     $manifest | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+}
+
+function New-RootLauncherBat {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StageDir
+    )
+
+    $launcherText = @"
+@echo off
+setlocal
+cd /d "%~dp0"
+set "RUNTIME_EXE=%~dp0_runtime\SkillWriterDesktop\SkillWriterDesktop.exe"
+set "RUNTIME_PY=%~dp0_runtime\SkillWriterDesktop\_internal\python39.dll"
+if not exist "%RUNTIME_EXE%" (
+  echo [error] runtime exe not found: %RUNTIME_EXE%
+  echo Please unzip the whole release package again.
+  pause
+  exit /b 1
+)
+if not exist "%RUNTIME_PY%" (
+  echo [error] runtime python not found: %RUNTIME_PY%
+  echo Please unzip the whole release package again. Do not copy only the EXE.
+  pause
+  exit /b 1
+)
+start "" "%RUNTIME_EXE%"
+"@
+    $launcherText | Set-Content -Path (Join-Path $StageDir "start_skill_writer_desktop.bat") -Encoding ASCII
 }
 
 function New-LauncherBat {
@@ -175,10 +254,11 @@ function Test-ReleasePackage {
     }
 
     $requiredFiles = @(
-        "SkillWriterDesktopPortable.exe",
-        "SkillWriterDesktop\SkillWriterDesktop.exe",
-        "SkillWriterDesktop\start_skill_writer_desktop.bat",
-        "SkillWriterDesktop\_internal\python39.dll",
+        "SkillWriterDesktop.exe",
+        "start_skill_writer_desktop.bat",
+        "_runtime\SkillWriterDesktop\SkillWriterDesktop.exe",
+        "_runtime\SkillWriterDesktop\start_skill_writer_desktop.bat",
+        "_runtime\SkillWriterDesktop\_internal\python39.dll",
         "scripts\run_local_skill_audit.py",
         "scripts\run_local_skill_test.py",
         "scripts\payload_compiler.py",
@@ -290,12 +370,27 @@ $releaseBuildWork = Join-Path $releaseBuildDir "build"
 $releasePortableDist = Join-Path $releaseBuildDir "dist_onefile"
 $releasePortableWork = Join-Path $releaseBuildDir "build_onefile"
 $stageDir = Join-Path $releaseDir "_stage_$timestamp"
-$stageAppDir = Join-Path $stageDir "SkillWriterDesktop"
+$stageAppDir = Join-Path $stageDir "_runtime\SkillWriterDesktop"
 $manifestPath = Join-Path $stageDir "RELEASE_NOTES.txt"
 $selfTestDir = Join-Path $releaseDir "_selftest_$timestamp"
 $selfTestReportPath = Join-Path $releaseDir "SkillWriterDesktop_$timestamp.selftest.txt"
 
 Write-Host "[release] project root: $projectRoot"
+
+if (-not (Test-Path -LiteralPath $releaseDir)) {
+    New-Item -ItemType Directory -Path $releaseDir | Out-Null
+}
+
+trap {
+    Write-Host "[release] cleaning transient artifacts after failure"
+    Clear-TransientReleaseArtifacts -ReleaseDir $releaseDir
+    break
+}
+
+Clear-TransientReleaseArtifacts -ReleaseDir $releaseDir
+Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "dist\scripts")
+Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "dist\bundled_skills")
+Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "dist\data")
 
 if (-not $SkipBuild) {
     Write-Host "[release] syncing bundled Codex skills"
@@ -341,18 +436,15 @@ if (-not (Test-Path -LiteralPath $portableExePath)) {
     throw "Portable EXE not found. Build first or run without -SkipBuild: $portableExePath"
 }
 
-if (-not (Test-Path -LiteralPath $releaseDir)) {
-    New-Item -ItemType Directory -Path $releaseDir | Out-Null
-}
-
 Remove-PythonCaches -RootPath $appDir
 Remove-PythonCaches -RootPath $portableDist
 Remove-PathWithRetry -TargetPath $stageDir
 New-Item -ItemType Directory -Path $stageDir | Out-Null
 Copy-Item -LiteralPath $appDir -Destination $stageAppDir -Recurse -Force
-Copy-Item -LiteralPath $portableExePath -Destination (Join-Path $stageDir "SkillWriterDesktopPortable.exe") -Force
+Copy-Item -LiteralPath $portableExePath -Destination (Join-Path $stageDir "SkillWriterDesktop.exe") -Force
 Copy-RuntimeAssets -RootPath $projectRoot -TargetPath $stageDir
 New-LauncherBat -AppDir $stageAppDir
+New-RootLauncherBat -StageDir $stageDir
 New-ReleaseManifest -AppDir $stageAppDir -ZipName $zipName -OutputPath $manifestPath
 
 if ((Test-Path -LiteralPath $zipPath) -and -not $KeepExistingZip) {
@@ -396,6 +488,8 @@ Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build_onefile")
 Remove-PathWithRetry -TargetPath $releaseBuildDir
 Remove-PathWithRetry -TargetPath $selfTestDir
 Remove-PathWithRetry -TargetPath $stageDir
+Clear-TransientReleaseArtifacts -ReleaseDir $releaseDir
+Remove-OldReleaseOutputs -ReleaseDir $releaseDir -KeepCount $KeepReleaseCount
 
 Write-Host "[release] done"
 Write-Host "[release] zip: $zipPath"

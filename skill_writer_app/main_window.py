@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import tkinter as tk
 from dataclasses import replace
 from datetime import datetime
@@ -82,8 +83,24 @@ class SkillWriterApp:
         "[finalize]",
         "[archive]",
         "[python-deps]",
+        "[codex-cli]",
+        "[codex-cmd]",
+        "[codex-output]",
+        "[codex-heartbeat]",
         "[codex-error]",
+        "[claude-cli]",
+        "[claude-cmd]",
+        "[claude-init]",
+        "[claude-progress]",
+        "[claude-tool]",
+        "[claude-tool-result]",
+        "[claude-heartbeat]",
+        "[claude-result]",
+        "[claude-result-error]",
         "[claude-error]",
+        "[workflow-watchdog]",
+        "[workflow-fallback]",
+        "[workflow-retry]",
         "[log-ui]",
     )
     CORE_LOG_CONTAINS = (
@@ -252,6 +269,7 @@ class SkillWriterApp:
         self.current_task_started_at: datetime | None = None
         self.current_active_task_key: str = ""
         self.last_log_at: datetime | None = None
+        self.develop_watchdog_after_id: str | None = None
 
         self.build_ui()
         self.write_full_log(
@@ -2049,6 +2067,127 @@ class SkillWriterApp:
             or bool(self.current_task_name)
         )
 
+    def active_model_runner(self):
+        if self.claude_runner.is_running():
+            return self.claude_runner
+        if self.codex_runner.is_running():
+            return self.codex_runner
+        if self.agent_backend_var.get() == "claude":
+            return self.claude_runner
+        return self.codex_runner
+
+    def cancel_develop_watchdog(self) -> None:
+        if not self.develop_watchdog_after_id:
+            return
+        try:
+            self.root.after_cancel(self.develop_watchdog_after_id)
+        except Exception:  # noqa: BLE001
+            pass
+        self.develop_watchdog_after_id = None
+
+    def schedule_develop_watchdog(self) -> None:
+        self.cancel_develop_watchdog()
+        self.develop_watchdog_after_id = self.root.after(60000, self.check_develop_watchdog)
+
+    def check_develop_watchdog(self) -> None:
+        self.develop_watchdog_after_id = None
+        if self.current_task_name != "技能开发":
+            return
+        runner = self.active_model_runner()
+        if not runner.is_running():
+            return
+
+        now = time.monotonic()
+        started_at = getattr(runner, "started_monotonic", 0.0) or now
+        last_output_at = getattr(runner, "last_output_monotonic", 0.0) or started_at
+        running_seconds = int(now - started_at)
+        idle_seconds = int(now - last_output_at)
+        usable, reason = self.has_usable_develop_artifacts(
+            self.latest_task_dir_var.get().strip(),
+            self.payload_var.get().strip(),
+        )
+
+        if usable and (running_seconds >= 480 or idle_seconds >= 180):
+            self.append_log(
+                "[workflow-watchdog] 已检测到可用开发产物，模型进程长时间未结束，自动停止模型并继续后续流程。"
+            )
+            self.append_log(f"[workflow-watchdog] 产物状态: {reason}")
+            runner.stop_running()
+            return
+
+        if running_seconds >= 1800 and not usable:
+            self.last_task_error_message = "技能开发超过 30 分钟仍未生成可用产物，工具已自动停止本次任务。请简化描述或重新新建技能任务。"
+            self.append_log("[workflow-watchdog] 技能开发超过 30 分钟仍未生成可用产物，已自动停止。")
+            runner.stop_running()
+            return
+
+        self.schedule_develop_watchdog()
+
+    def schedule_develop_auto_retry(self, reason: str) -> bool:
+        target_key = self.current_active_task_key or self.current_target_key()
+        if not target_key:
+            return False
+
+        runs = self.active_task_service.load()
+        task_info = runs.get(target_key, {})
+        try:
+            retry_count = int(task_info.get("develop_auto_retry_count", 0) or 0)
+        except (TypeError, ValueError):
+            retry_count = 0
+        max_retry_count = 3
+        if retry_count >= max_retry_count:
+            self.append_log(
+                f"[workflow-retry] 技能开发自动续接已达到上限 {max_retry_count} 次，本轮停止。"
+            )
+            return False
+
+        next_retry = retry_count + 1
+        session_id = str(task_info.get("session_id", "") or "")
+        retry_note = (
+            f"[workflow-retry] 技能开发异常退出且暂未发现可用产物，"
+            f"自动续接重试 {next_retry}/{max_retry_count}。"
+        )
+        if session_id:
+            retry_note += f" session={session_id}"
+        self.append_log(retry_note)
+        self.append_log(f"[workflow-retry] 失败原因: {reason}")
+
+        self.active_task_service.update(
+            target_key,
+            status="interrupted",
+            step="develop",
+            task_name="技能开发",
+            develop_auto_retry_count=next_retry,
+            last_develop_failure=reason,
+        )
+        self.write_task_handoff(status="interrupted", current_step="develop")
+
+        self.current_task_name = ""
+        self.current_active_task_key = ""
+        self.current_task_started_at = None
+        self.status_var.set("自动续接技能开发")
+        self.set_task_stage("自动续接开发")
+        self.update_action_buttons()
+        self.root.after(1500, self.run_develop)
+        return True
+
+    def recent_full_log_text(self, max_chars: int = 40000) -> str:
+        try:
+            text = self.full_log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return ""
+        return text[-max_chars:]
+
+    def should_auto_repair_after_audit_failure(self) -> bool:
+        recent = self.recent_full_log_text()
+        known_payload_errors = (
+            "payload.rows 缺失或类型错误",
+            "payload rows missing",
+            "payload rows invalid",
+            "temp_excel_payload.json 缺少 rows",
+        )
+        return any(token in recent for token in known_payload_errors)
+
     def workflow_step_order(self) -> list[str]:
         return ["develop", "audit", "compile", "test", "preview", "copy", "real"]
 
@@ -2656,16 +2795,7 @@ class SkillWriterApp:
 
         has_task_dir = bool(task_path and task_path.exists() and task_path.is_dir())
         has_payload = bool(payload_path and payload_path.exists() and payload_path.is_file())
-        has_develop_artifacts = bool(
-            has_task_dir
-            and has_payload
-            and (
-                (task_path / "docs" / "IMPLEMENTATION.md").is_file()
-                or (task_path / "IMPLEMENTATION.md").is_file()
-                or any(task_path.glob("action_*.lua"))
-                or any(task_path.glob("buff_*.lua"))
-            )
-        )
+        has_develop_artifacts = self.has_usable_develop_artifacts(task_dir, payload)[0]
         has_compiled_artifacts = bool(
             task_path
             and (
@@ -2720,6 +2850,48 @@ class SkillWriterApp:
             flags["copy"] = False
         if flags["real"] and not (flags["preview"] and flags["copy"]):
             flags["real"] = False
+
+    def has_usable_develop_artifacts(self, task_dir: str, payload: str) -> tuple[bool, str]:
+        task_path = Path(task_dir) if task_dir else None
+        payload_path = Path(payload) if payload else None
+        if not task_path or not task_path.exists() or not task_path.is_dir():
+            return False, "任务目录不存在"
+        if not payload_path or not payload_path.exists() or not payload_path.is_file():
+            discovered = self.workspace_manager.find_primary_payload_for_dir(task_path)
+            if discovered and discovered.exists():
+                payload_path = discovered
+                self.payload_var.set(str(discovered))
+            else:
+                return False, "payload 未生成"
+
+        try:
+            payload_data = json.loads(payload_path.read_text(encoding="utf-8"))
+            rows = payload_data.get("rows", {})
+            row_count = sum(len(rows.get(name, [])) for name in ("skill", "skill_stage", "buff", "war_paper"))
+        except Exception:  # noqa: BLE001
+            row_count = 0
+        if row_count <= 0:
+            return False, "payload 没有有效 rows"
+
+        lua_patterns = ("action_*.lua", "buff_*.lua", "mechanism_*.lua", "regression_*.lua")
+        search_dirs = [
+            task_path,
+            task_path / "scripts",
+            task_path / "actions",
+            task_path / "buffs",
+            task_path / "tests",
+        ]
+        lua_files: list[Path] = []
+        for folder in search_dirs:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            for pattern in lua_patterns:
+                lua_files.extend(path for path in folder.glob(pattern) if path.is_file())
+
+        has_doc = (task_path / "docs" / "IMPLEMENTATION.md").is_file() or (task_path / "IMPLEMENTATION.md").is_file()
+        if not lua_files and not has_doc:
+            return False, "未发现 Lua 或实现说明产物"
+        return True, f"payload rows={row_count}, lua={len(lua_files)}, doc={'yes' if has_doc else 'no'}"
 
     def has_excel_copy_outputs(self) -> bool:
         copy_dir_value = self.copy_dir_var.get().strip()
@@ -2972,6 +3144,31 @@ class SkillWriterApp:
             self.serial_pending_steps.pop(0)
 
         if code != 0:
+            if step == "develop":
+                usable, reason = self.has_usable_develop_artifacts(
+                    self.latest_task_dir_var.get().strip(),
+                    self.payload_var.get().strip(),
+                )
+                if usable:
+                    self.append_log(
+                        "[workflow-fallback] 技能开发返回失败，但已检测到可用产物，串行流程自动继续。"
+                    )
+                    self.append_log(f"[workflow-fallback] 产物状态: {reason}")
+                    self.last_task_error_message = ""
+                    code = 0
+                else:
+                    self.append_log(f"[workflow-fallback] 技能开发失败且没有可用产物: {reason}")
+            elif step == "audit" and self.should_auto_repair_after_audit_failure():
+                retry_reason = "本地预审发现 temp_excel_payload.json 无有效 rows，已自动回到技能开发补齐配置产物。"
+                self.append_log(f"[workflow-retry] {retry_reason}")
+                if self.schedule_develop_auto_retry(retry_reason):
+                    self.update_action_buttons()
+                    return True
+            if code == 0:
+                self.update_action_buttons()
+                self.root.after(200, self.run_next_serial_step)
+                return True
+
             detail = f"串行流程已终止：{task_name} 执行失败。"
             if self.last_task_error_message:
                 detail += f"\n\n错误详情:\n{self.last_task_error_message}"
@@ -4886,6 +5083,7 @@ class SkillWriterApp:
                         session_file,
                     ),
                 )
+            self.schedule_develop_watchdog()
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("错误", str(exc))
             self.status_var.set("就绪")
@@ -4894,6 +5092,7 @@ class SkillWriterApp:
             self.current_task_name = ""
             self.current_active_task_key = ""
             self.current_task_started_at = None
+            self.cancel_develop_watchdog()
             self.update_action_buttons()
 
     def run_test(self) -> None:
@@ -5009,11 +5208,14 @@ class SkillWriterApp:
 
     def finish_task(self, task_name: str, code: int) -> None:
         serial_context = self.serial_workflow_active
+        if self.task_name_to_step(task_name) == "develop":
+            self.cancel_develop_watchdog()
         self.flush_log_queue(max_batches=None)
         remaining_safe_lines = self.log_sanitizer.flush()
         if remaining_safe_lines:
             self.append_log("\n".join(remaining_safe_lines) + "\n")
-        self.refresh_temp_workspace_views(force_latest=code == 0 and self.task_name_to_step(task_name) == "develop")
+        step_key = self.task_name_to_step(task_name)
+        self.refresh_temp_workspace_views(force_latest=code == 0 and step_key == "develop")
         if self.codex_runner.last_error_message:
             self.last_task_error_message = self.codex_runner.last_error_message
         elif self.claude_runner.last_error_message:
@@ -5022,9 +5224,31 @@ class SkillWriterApp:
             self.last_task_error_message = self.local_script_runner.last_error_message
         elif self.writeback_service.last_error_message:
             self.last_task_error_message = self.writeback_service.last_error_message
-        if code == 0 and self.task_name_to_step(task_name) == "real":
+        if code != 0 and step_key == "develop":
+            usable, reason = self.has_usable_develop_artifacts(
+                self.latest_task_dir_var.get().strip(),
+                self.payload_var.get().strip(),
+            )
+            if usable:
+                self.append_log(
+                    "[workflow-fallback] 技能开发命令退出码非 0，但已检测到可用开发产物，自动继续后续本地流程。"
+                )
+                self.append_log(f"[workflow-fallback] 产物状态: {reason}")
+                self.last_task_error_message = ""
+                code = 0
+            else:
+                self.append_log(f"[workflow-fallback] 未检测到可继续的开发产物: {reason}")
+                retry_reason = self.last_task_error_message or reason
+                if self.schedule_develop_auto_retry(retry_reason):
+                    return
+        if code != 0 and step_key == "audit" and self.should_auto_repair_after_audit_failure():
+            retry_reason = "本地预审发现 temp_excel_payload.json 无有效 rows，已自动回到技能开发补齐配置产物。"
+            self.append_log(f"[workflow-retry] {retry_reason}")
+            if self.schedule_develop_auto_retry(retry_reason):
+                return
+        if code == 0 and step_key == "real":
             self.current_archive_dir = self.archive_current_task()
-        if code == 0 and self.task_name_to_step(task_name) == "develop":
+        if code == 0 and step_key == "develop":
             self.mark_downstream_steps_dirty_after_develop()
         history_entry = self.build_history_entry(task_name, code)
         self.history_entries = self.history_service.append(history_entry)

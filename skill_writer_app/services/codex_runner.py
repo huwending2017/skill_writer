@@ -36,6 +36,8 @@ class CodexRunner:
         self.process: Optional[subprocess.Popen[bytes]] = None
         self.last_error_message: str = ""
         self.last_resolved_executable: str = ""
+        self.started_monotonic: float = 0.0
+        self.last_output_monotonic: float = 0.0
 
     def _windows_subprocess_kwargs(self) -> dict:
         return windows_subprocess_kwargs()
@@ -250,6 +252,8 @@ class CodexRunner:
             raise RuntimeError("当前已有 Codex 任务正在运行")
 
         self.last_error_message = ""
+        self.started_monotonic = time.monotonic()
+        self.last_output_monotonic = self.started_monotonic
         if resume_session_id or resume_last:
             command = self.build_resume_command(
                 output_file=output_file,
@@ -316,6 +320,7 @@ class CodexRunner:
 
                 threading.Thread(target=read_stdout, daemon=True).start()
                 last_output_at = time.monotonic()
+                self.last_output_monotonic = last_output_at
                 while True:
                     try:
                         raw_line = stream_queue.get(timeout=30)
@@ -329,6 +334,7 @@ class CodexRunner:
                         break
 
                     last_output_at = time.monotonic()
+                    self.last_output_monotonic = last_output_at
                     output_line = decode_process_output(raw_line).rstrip("\r\n")
                     if not detected_session_id:
                         detected_session_id, session_file = self.find_latest_session_for_workspace(

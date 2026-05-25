@@ -20,6 +20,8 @@ class ClaudeRunner:
         self.process: Optional[subprocess.Popen[bytes]] = None
         self.last_error_message: str = ""
         self.last_resolved_executable: str = ""
+        self.started_monotonic: float = 0.0
+        self.last_output_monotonic: float = 0.0
 
     def _windows_subprocess_kwargs(self) -> dict:
         return windows_subprocess_kwargs()
@@ -109,6 +111,8 @@ class ClaudeRunner:
             raise RuntimeError("当前已有 Claude 任务正在运行")
 
         self.last_error_message = ""
+        self.started_monotonic = time.monotonic()
+        self.last_output_monotonic = self.started_monotonic
         command = self.build_command(
             workspace_root=workspace_root,
             executable_path=executable_path,
@@ -160,6 +164,7 @@ class ClaudeRunner:
 
                 threading.Thread(target=read_stdout, daemon=True).start()
                 last_output_at = time.monotonic()
+                self.last_output_monotonic = last_output_at
                 while True:
                     try:
                         raw_line = stream_queue.get(timeout=30)
@@ -173,6 +178,7 @@ class ClaudeRunner:
                         break
 
                     last_output_at = time.monotonic()
+                    self.last_output_monotonic = last_output_at
                     output_line = decode_process_output(raw_line).rstrip("\r\n")
                     try:
                         payload = json.loads(output_line)
@@ -194,13 +200,18 @@ class ClaudeRunner:
                         log_queue.put(f"[claude-init] cwd={cwd} model={active_model}")
                     elif payload_type == "assistant":
                         content = payload.get("message", {}).get("content", [])
+                        emitted = False
                         for block in content if isinstance(content, list) else []:
                             if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
                                 log_queue.put(str(block["text"]))
+                                emitted = True
                             elif isinstance(block, dict) and block.get("type") == "tool_use":
                                 tool_name = str(block.get("name", "") or "")
                                 tool_input = self._short_json(block.get("input", {}))
                                 log_queue.put(f"[claude-tool] {tool_name} {tool_input}")
+                                emitted = True
+                        if not emitted:
+                            log_queue.put("[claude-progress] Claude 已返回 assistant 事件，继续等待后续输出。")
                     elif payload_type == "user":
                         content = payload.get("message", {}).get("content", [])
                         for block in content if isinstance(content, list) else []:
@@ -208,12 +219,28 @@ class ClaudeRunner:
                                 continue
                             if block.get("is_error"):
                                 log_queue.put(f"[claude-tool-error] {self._short_json(block.get('content', ''))}")
+                            else:
+                                content_value = block.get("content", "")
+                                if isinstance(content_value, str):
+                                    summary = content_value.replace("\r", " ").replace("\n", " ").strip()
+                                    if len(summary) > 220:
+                                        summary = summary[:220] + "..."
+                                    if summary:
+                                        log_queue.put(f"[claude-tool-result] {summary}")
+                                    else:
+                                        log_queue.put("[claude-tool-result] 工具调用完成。")
+                                else:
+                                    log_queue.put("[claude-tool-result] 工具调用完成。")
                     elif payload_type == "result":
                         final_result = str(payload.get("result", "") or "")
                         if payload.get("is_error"):
                             log_queue.put(f"[claude-result-error] {final_result or payload.get('subtype', '')}")
+                        else:
+                            log_queue.put("[claude-result] Claude 任务完成，正在收尾。")
                         if final_result:
                             log_queue.put(final_result)
+                    elif payload_type:
+                        log_queue.put(f"[claude-progress] event={payload_type} subtype={payload.get('subtype', '')}")
 
                 return_code = self.process.wait()
                 Path(output_file).write_text(final_result, encoding="utf-8")
