@@ -131,7 +131,7 @@ class ClaudeRunner:
                 log_queue.put("[claude-cli] " + self.last_resolved_executable)
                 run_command = normalize_windows_script_command(command)
                 log_queue.put("[claude-cmd] " + subprocess.list2cmdline(run_command))
-                self.process = subprocess.Popen(
+                proc = subprocess.Popen(
                     run_command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -141,24 +141,25 @@ class ClaudeRunner:
                     env=self._subprocess_env(),
                     **self._windows_subprocess_kwargs(),
                 )
+                self.process = proc
 
-                assert self.process.stdin is not None
+                assert proc.stdin is not None
                 prompt_input = prompt if prompt.endswith("\n") else prompt + "\n"
                 try:
-                    self.process.stdin.write(prompt_input.encode("utf-8"))
-                    self.process.stdin.flush()
-                    self.process.stdin.close()
+                    proc.stdin.write(prompt_input.encode("utf-8"))
+                    proc.stdin.flush()
+                    proc.stdin.close()
                 except BrokenPipeError as exc:
                     raise RuntimeError(
                         "Claude CLI 提前退出，未接收任务内容；通常是 Claude 参数、认证或本机 CLI 环境异常。"
                     ) from exc
 
-                assert self.process.stdout is not None
+                assert proc.stdout is not None
                 stream_queue: Queue[Optional[bytes]] = Queue()
 
                 def read_stdout() -> None:
-                    assert self.process is not None and self.process.stdout is not None
-                    for stdout_line in self.process.stdout:
+                    assert proc.stdout is not None
+                    for stdout_line in proc.stdout:
                         stream_queue.put(stdout_line)
                     stream_queue.put(None)
 
@@ -169,7 +170,7 @@ class ClaudeRunner:
                     try:
                         raw_line = stream_queue.get(timeout=30)
                     except Empty:
-                        if self.process is not None and self.process.poll() is None:
+                        if proc.poll() is None:
                             idle_seconds = int(time.monotonic() - last_output_at)
                             log_queue.put(f"[claude-heartbeat] Claude 仍在运行，已 {idle_seconds} 秒无新输出。")
                             continue
@@ -242,7 +243,7 @@ class ClaudeRunner:
                     elif payload_type:
                         log_queue.put(f"[claude-progress] event={payload_type} subtype={payload.get('subtype', '')}")
 
-                return_code = self.process.wait()
+                return_code = proc.wait()
                 Path(output_file).write_text(final_result, encoding="utf-8")
             except Exception as exc:  # noqa: BLE001
                 self.last_error_message = str(exc)

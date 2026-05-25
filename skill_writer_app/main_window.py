@@ -2134,7 +2134,7 @@ class SkillWriterApp:
             retry_count = int(task_info.get("develop_auto_retry_count", 0) or 0)
         except (TypeError, ValueError):
             retry_count = 0
-        max_retry_count = 3
+        max_retry_count = 4
         if retry_count >= max_retry_count:
             self.append_log(
                 f"[workflow-retry] 技能开发自动续接已达到上限 {max_retry_count} 次，本轮停止。"
@@ -2143,23 +2143,30 @@ class SkillWriterApp:
 
         next_retry = retry_count + 1
         session_id = str(task_info.get("session_id", "") or "")
+        force_fresh_session = next_retry >= 2
         retry_note = (
             f"[workflow-retry] 技能开发异常退出且暂未发现可用产物，"
             f"自动续接重试 {next_retry}/{max_retry_count}。"
         )
-        if session_id:
+        if force_fresh_session:
+            retry_note += " 本次将跳过旧 session，用任务目录上下文重新发起开发。"
+        elif session_id:
             retry_note += f" session={session_id}"
         self.append_log(retry_note)
         self.append_log(f"[workflow-retry] 失败原因: {reason}")
 
-        self.active_task_service.update(
-            target_key,
-            status="interrupted",
-            step="develop",
-            task_name="技能开发",
-            develop_auto_retry_count=next_retry,
-            last_develop_failure=reason,
-        )
+        updates = {
+            "status": "interrupted",
+            "step": "develop",
+            "task_name": "技能开发",
+            "develop_auto_retry_count": next_retry,
+            "last_develop_failure": reason,
+            "force_fresh_session": force_fresh_session,
+        }
+        if force_fresh_session:
+            updates["session_id"] = ""
+            updates["session_file"] = ""
+        self.active_task_service.update(target_key, **updates)
         self.write_task_handoff(status="interrupted", current_step="develop")
 
         self.current_task_name = ""
@@ -2184,9 +2191,36 @@ class SkillWriterApp:
             "payload.rows 缺失或类型错误",
             "payload rows missing",
             "payload rows invalid",
+            "payload must contain rows object",
             "temp_excel_payload.json 缺少 rows",
         )
         return any(token in recent for token in known_payload_errors)
+
+    def append_last_model_output_summary(self, reason: str) -> None:
+        output_file = self.default_output_file()
+        if not output_file.exists():
+            self.append_log(f"[workflow-diagnose] {reason}；模型最后输出文件不存在: {output_file}")
+            return
+        try:
+            text = output_file.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception as exc:  # noqa: BLE001
+            self.append_log(f"[workflow-diagnose] {reason}；读取模型最后输出失败: {exc}")
+            return
+        if not text:
+            self.append_log(f"[workflow-diagnose] {reason}；模型最后输出为空。")
+            return
+        compact_lines = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if len(line) > 220:
+                line = line[:220] + "..."
+            compact_lines.append(line)
+            if len(compact_lines) >= 12:
+                break
+        if compact_lines:
+            self.append_log("[workflow-diagnose] 模型最后输出摘要:\n" + "\n".join(compact_lines))
 
     def workflow_step_order(self) -> list[str]:
         return ["develop", "audit", "compile", "test", "preview", "copy", "real"]
@@ -2349,11 +2383,13 @@ class SkillWriterApp:
         task_dir = str(task_info.get("task_dir", "") or self.latest_task_dir_var.get().strip())
         payload = str(task_info.get("payload_path", "") or self.payload_var.get().strip())
         previous_backend = str(task_info.get("agent_backend", "") or "未知")
+        last_failure = str(task_info.get("last_develop_failure", "") or "")
         context_block = self.build_local_task_context_block(task_dir, payload)
         return (
             "继续上一次未完成的技能开发任务，不要重新创建一套新的任务目录或新的脚本方案。\n"
             "优先检查并沿用已经存在的 temp_skill_workspace 任务目录、Lua 脚本、临时配置、payload、说明文档和测试文件。\n"
             "如果发现上次只完成了一部分，请在原有产物基础上补齐、修复、验证，并保持同一个技能方案继续推进。\n\n"
+            f"{self.build_develop_artifact_contract(task_dir, payload, last_failure)}\n\n"
             f"上次执行后端: {previous_backend}\n"
             f"上次任务目录: {task_dir or '未识别'}\n"
             f"上次 payload: {payload or '未识别'}\n\n"
@@ -2366,7 +2402,7 @@ class SkillWriterApp:
         task_dir = self.latest_task_dir_var.get().strip()
         payload = self.payload_var.get().strip()
         if not task_dir:
-            return original_prompt
+            return f"{self.build_develop_artifact_contract(task_dir, payload)}\n\n{original_prompt}"
         return (
             "本次是工具中已确认命名的一轮技能开发，请严格使用下面这个任务目录作为本次所有临时产物的管理目录。\n"
             "不要把本次产物写到其他旧任务目录，也不要复用其他技能任务的 payload、临时 Excel、测试文件或 repair 目录。\n"
@@ -2374,8 +2410,28 @@ class SkillWriterApp:
             f"本次 payload: {payload or '请写到任务目录/config/temp_excel_payload.json'}\n"
             "本次目录结构约定: config/ 放 payload 和临时配置；scripts/ 放临时 Lua/辅助脚本；tests/ 放测试；docs/ 放实现说明；"
             "excel_test_copy/ 放本次 Excel 副本；excel_backup/ 放本次正式回写备份。\n\n"
+            f"{self.build_develop_artifact_contract(task_dir, payload)}\n\n"
             f"{original_prompt}"
         )
+
+    def build_develop_artifact_contract(self, task_dir: str, payload: str, last_failure: str = "") -> str:
+        payload_path = payload or (str(Path(task_dir) / "config" / "temp_excel_payload.json") if task_dir else "")
+        lines = [
+            "【硬性产物要求】",
+            "本轮技能开发不是只做分析或给建议，必须直接写入本地文件。",
+            "如果 $family-battle-skill-writer 技能未被当前模型环境正确加载，也必须按下面约定继续完成产物生成。",
+            f"1. 必须创建或修复 payload 文件: {payload_path or '任务目录/config/temp_excel_payload.json'}",
+            "2. payload 必须是 JSON 对象，且必须包含 rows 对象，结构至少如下:",
+            '{"rows":{"skill":[],"skill_stage":[],"buff":[],"war_paper":[]}}',
+            "3. rows 中至少要有 skill、skill_stage、buff 任意一类有效行；需要战报时必须补 war_paper。",
+            "4. 必须在任务目录 scripts/、tests/、docs/ 或 config/ 下生成实际产物，不能只输出说明文本。",
+            "5. 结束前必须自查 payload.rows 是否存在且非空；如果没有生成，不允许结束。",
+            "6. Lua 配置字段禁止输出 JSON/数组字面量，例如 [\"ATK\",10000]；应转换成 Excel/Lua 可识别的字符串格式。",
+            "7. 新增/修改 Lua 必须包含关键中文注释和必要 DEBUG(...) 调试点。",
+        ]
+        if last_failure:
+            lines.append(f"上一次失败原因: {last_failure}。本次必须优先修复这个失败原因。")
+        return "\n".join(lines)
 
     def build_local_task_context_block(self, task_dir: str, payload: str) -> str:
         lines = ["本地任务接力上下文（优先依赖这些本地产物，而不是重新从 0 扫描）："]
@@ -3143,6 +3199,9 @@ class SkillWriterApp:
         if self.serial_pending_steps and self.serial_pending_steps[0] == step:
             self.serial_pending_steps.pop(0)
 
+        if code == 0 and step == "develop":
+            self.serial_pending_steps = self.build_serial_steps("audit")
+
         if code != 0:
             if step == "develop":
                 usable, reason = self.has_usable_develop_artifacts(
@@ -3158,8 +3217,15 @@ class SkillWriterApp:
                     code = 0
                 else:
                     self.append_log(f"[workflow-fallback] 技能开发失败且没有可用产物: {reason}")
+                    self.append_last_model_output_summary(reason)
             elif step == "audit" and self.should_auto_repair_after_audit_failure():
                 retry_reason = "本地预审发现 temp_excel_payload.json 无有效 rows，已自动回到技能开发补齐配置产物。"
+                self.append_log(f"[workflow-retry] {retry_reason}")
+                if self.schedule_develop_auto_retry(retry_reason):
+                    self.update_action_buttons()
+                    return True
+            elif step == "compile" and self.should_auto_repair_after_audit_failure():
+                retry_reason = "本地编译发现 temp_excel_payload.json 无有效 rows，已自动回到技能开发补齐配置产物。"
                 self.append_log(f"[workflow-retry] {retry_reason}")
                 if self.schedule_develop_auto_retry(retry_reason):
                     self.update_action_buttons()
@@ -4985,7 +5051,11 @@ class SkillWriterApp:
             resume_key, resume_info = resume_match
             previous_backend = str(resume_info.get("agent_backend", "") or "codex")
             current_backend = self.agent_backend_var.get().strip() or "codex"
-            if previous_backend == current_backend:
+            force_fresh_session = bool(resume_info.get("force_fresh_session"))
+            if force_fresh_session:
+                resume_session_id = ""
+                resume_last = False
+            elif previous_backend == current_backend:
                 resume_session_id = str(resume_info.get("session_id", "") or "")
                 resume_last = not bool(resume_session_id)
             else:
@@ -5012,7 +5082,9 @@ class SkillWriterApp:
                 self.append_log(
                     "[workflow-resume] 命中未完成的技能开发任务，"
                     + (
-                        f"同后端续接 session={resume_session_id}"
+                        "已跳过旧 session，使用本地任务目录上下文重新发起开发"
+                        if force_fresh_session
+                        else f"同后端续接 session={resume_session_id}"
                         if resume_session_id
                         else (
                             f"后端已从 {previous_backend} 切到 {current_backend}，改用本地任务上下文接力"
@@ -5238,11 +5310,17 @@ class SkillWriterApp:
                 code = 0
             else:
                 self.append_log(f"[workflow-fallback] 未检测到可继续的开发产物: {reason}")
+                self.append_last_model_output_summary(reason)
                 retry_reason = self.last_task_error_message or reason
                 if self.schedule_develop_auto_retry(retry_reason):
                     return
         if code != 0 and step_key == "audit" and self.should_auto_repair_after_audit_failure():
             retry_reason = "本地预审发现 temp_excel_payload.json 无有效 rows，已自动回到技能开发补齐配置产物。"
+            self.append_log(f"[workflow-retry] {retry_reason}")
+            if self.schedule_develop_auto_retry(retry_reason):
+                return
+        if code != 0 and step_key == "compile" and self.should_auto_repair_after_audit_failure():
+            retry_reason = "本地编译发现 temp_excel_payload.json 无有效 rows，已自动回到技能开发补齐配置产物。"
             self.append_log(f"[workflow-retry] {retry_reason}")
             if self.schedule_develop_auto_retry(retry_reason):
                 return

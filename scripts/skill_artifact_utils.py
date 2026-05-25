@@ -164,6 +164,17 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 PAYLOAD_SHEET_NAMES = ("skill", "skill_global", "skill_stage", "buff", "war_paper")
+LEGACY_PAYLOAD_SHEET_ALIASES = {
+    "data_skill": "skill",
+    "data_skill_global": "skill_global",
+    "data_skill_stage": "skill_stage",
+    "data_buff": "buff",
+    "data_war_paper": "war_paper",
+    "skills": "skill",
+    "stages": "skill_stage",
+    "buffs": "buff",
+    "war_papers": "war_paper",
+}
 
 
 def ensure_payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
@@ -178,6 +189,15 @@ def ensure_payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
         sheet_rows = payload.get(sheet_name)
         if isinstance(sheet_rows, list):
             detected_rows[sheet_name] = sheet_rows
+    for legacy_name, sheet_name in LEGACY_PAYLOAD_SHEET_ALIASES.items():
+        legacy_value = payload.get(legacy_name)
+        sheet_rows = None
+        if isinstance(legacy_value, list):
+            sheet_rows = legacy_value
+        elif isinstance(legacy_value, dict) and isinstance(legacy_value.get("rows"), list):
+            sheet_rows = legacy_value.get("rows")
+        if sheet_rows is not None and sheet_name not in detected_rows:
+            detected_rows[sheet_name] = sheet_rows
 
     if not detected_rows:
         return payload
@@ -185,7 +205,7 @@ def ensure_payload_rows(payload: dict[str, Any]) -> dict[str, Any]:
     normalized = {
         key: value
         for key, value in payload.items()
-        if key not in PAYLOAD_SHEET_NAMES and key != "rows"
+        if key not in PAYLOAD_SHEET_NAMES and key not in LEGACY_PAYLOAD_SHEET_ALIASES and key != "rows"
     }
     normalized["rows"] = detected_rows
     return normalized
@@ -228,6 +248,8 @@ def _excel_config_scalar_text(value: Any) -> str:
 
 
 def _excel_config_literal_text(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return "" if not value else None
     if isinstance(value, (list, tuple)):
         if all(_is_excel_config_scalar(item) for item in value):
             return ",".join(_excel_config_scalar_text(item) for item in value)
@@ -280,6 +302,9 @@ def normalize_excel_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
             for field, value in row.items():
                 if isinstance(value, str):
                     normalized_row[field] = normalize_excel_config_literals_in_string(value)
+                elif isinstance(value, dict):
+                    text = _excel_config_literal_text(value)
+                    normalized_row[field] = text if text is not None else value
                 else:
                     normalized_row[field] = value
             normalized_sheet_rows.append(normalized_row)
@@ -302,7 +327,7 @@ def find_invalid_excel_config_literals(payload: dict[str, Any], limit: int = 30)
                 continue
             row_key = row.get("key") or row.get("name") or row.get("id") or index
             for field, value in row.items():
-                if isinstance(value, dict):
+                if isinstance(value, dict) and value:
                     findings.append(f"{sheet_name}[{index}] key={row_key} field={field} uses dict literal; use comma/pipe config text")
                 elif isinstance(value, str):
                     normalized = normalize_excel_config_literals_in_string(value)

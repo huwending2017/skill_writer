@@ -264,6 +264,8 @@ def excel_config_scalar_text(value: Any) -> str:
 
 
 def excel_config_literal_text(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return "" if not value else None
     if isinstance(value, (list, tuple)):
         if all(is_excel_config_scalar(item) for item in value):
             return ",".join(excel_config_scalar_text(item) for item in value)
@@ -310,9 +312,12 @@ def normalize_excel_config_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(value, str):
                     normalized_row[field] = normalize_excel_config_literals_in_string(value)
                 elif isinstance(value, dict):
-                    raise ValueError(
-                        f"{sheet_name} field {field} uses a dict value; Excel config cells must use comma/pipe text."
-                    )
+                    text = excel_config_literal_text(value)
+                    if text is None:
+                        raise ValueError(
+                            f"{sheet_name} field {field} uses a dict value; Excel config cells must use comma/pipe text."
+                        )
+                    normalized_row[field] = text
                 else:
                     normalized_row[field] = value
             normalized_sheet_rows.append(normalized_row)
