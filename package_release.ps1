@@ -74,6 +74,7 @@ function Copy-RuntimeAssets {
     }
 
     New-Item -ItemType Directory -Force -Path (Join-Path $TargetPath "data\logs") | Out-Null
+    Remove-PythonCaches -RootPath $TargetPath
 }
 
 function New-ReleaseManifest {
@@ -106,6 +107,169 @@ function New-ReleaseManifest {
     $manifest | Set-Content -LiteralPath $OutputPath -Encoding UTF8
 }
 
+function New-LauncherBat {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AppDir
+    )
+
+    $launcherBat = Join-Path $AppDir "start_skill_writer_desktop.bat"
+    @"
+@echo off
+setlocal
+cd /d "%~dp0"
+if not exist "%~dp0SkillWriterDesktop.exe" (
+  echo [error] SkillWriterDesktop.exe not found.
+  pause
+  exit /b 1
+)
+if not exist "%~dp0_internal\python39.dll" (
+  echo [error] _internal\python39.dll not found.
+  echo Please unzip the whole release package before running. Do not copy only the EXE.
+  pause
+  exit /b 1
+)
+if not exist "%~dp0_internal\tcl86t.dll" (
+  echo [error] _internal\tcl86t.dll not found.
+  echo The release package is incomplete. Please unzip the whole package again.
+  pause
+  exit /b 1
+)
+start "" "%~dp0SkillWriterDesktop.exe"
+"@ | Set-Content -Path $launcherBat -Encoding ASCII
+}
+
+function Test-ReleasePackage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZipPath,
+        [Parameter(Mandatory = $true)]
+        [string]$ExtractPath,
+        [Parameter(Mandatory = $true)]
+        [string]$ReportPath
+    )
+
+    $report = New-Object System.Collections.Generic.List[string]
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    function Add-CheckLine {
+        param(
+            [string]$Status,
+            [string]$Message
+        )
+        $report.Add("[$Status] $Message") | Out-Null
+        if ($Status -eq "FAIL") {
+            $errors.Add($Message) | Out-Null
+        }
+    }
+
+    Remove-PathWithRetry -TargetPath $ExtractPath
+    New-Item -ItemType Directory -Force -Path $ExtractPath | Out-Null
+
+    try {
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $ExtractPath)
+    } catch {
+        Add-CheckLine -Status "FAIL" -Message ("Unzip release package failed: {0}" -f $_.Exception.Message)
+        $report | Set-Content -LiteralPath $ReportPath -Encoding UTF8
+        throw "Release self-test failed: unzip failed"
+    }
+
+    $requiredFiles = @(
+        "SkillWriterDesktopPortable.exe",
+        "SkillWriterDesktop\SkillWriterDesktop.exe",
+        "SkillWriterDesktop\start_skill_writer_desktop.bat",
+        "SkillWriterDesktop\_internal\python39.dll",
+        "scripts\run_local_skill_audit.py",
+        "scripts\run_local_skill_test.py",
+        "scripts\payload_compiler.py",
+        "scripts\skill_artifact_utils.py",
+        "bundled_skills\family-battle-skill-writer\SKILL.md",
+        "RELEASE_NOTES.txt",
+        "README.md"
+    )
+
+    foreach ($relative in $requiredFiles) {
+        $path = Join-Path $ExtractPath $relative
+        if (Test-Path -LiteralPath $path) {
+            Add-CheckLine -Status "OK" -Message "exists: $relative"
+        } else {
+            Add-CheckLine -Status "FAIL" -Message "missing: $relative"
+        }
+    }
+
+    $dataLogs = Join-Path $ExtractPath "data\logs"
+    if (Test-Path -LiteralPath $dataLogs) {
+        Add-CheckLine -Status "OK" -Message "exists: data\logs"
+    } else {
+        Add-CheckLine -Status "FAIL" -Message "missing: data\logs"
+    }
+
+    $cacheItems = Get-ChildItem -LiteralPath $ExtractPath -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq "__pycache__" -or $_.Extension -eq ".pyc" }
+    if ($cacheItems) {
+        Add-CheckLine -Status "FAIL" -Message ("release package contains Python cache files: {0}" -f $cacheItems.Count)
+    } else {
+        Add-CheckLine -Status "OK" -Message "no __pycache__ / .pyc files"
+    }
+
+    $compileTargets = @(
+        "scripts\run_local_skill_audit.py",
+        "scripts\run_local_skill_test.py",
+        "scripts\payload_compiler.py",
+        "scripts\skill_artifact_utils.py"
+    ) | ForEach-Object { Join-Path $ExtractPath $_ }
+
+    $existingCompileTargets = $compileTargets | Where-Object { Test-Path -LiteralPath $_ }
+    if ($existingCompileTargets.Count -gt 0) {
+        $compileOutput = & python -B -m py_compile @existingCompileTargets 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Add-CheckLine -Status "OK" -Message "core script syntax check passed"
+        } else {
+            Add-CheckLine -Status "FAIL" -Message ("core script syntax check failed: {0}" -f ($compileOutput | Out-String))
+        }
+    } else {
+        Add-CheckLine -Status "FAIL" -Message "no core scripts found for syntax check"
+    }
+
+    $classifierCheck = @'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts"))
+from run_local_skill_test import is_unsupported_embedded_regression_error
+samples = [
+    'lupa.lua55.LuaError: [string "<python>"]:202: first num should be owner camp value',
+    "lupa.lua55.LuaError: service/battle/module/buffs_new/buff_stunt_tianren.lua:93: attempt to index a boolean value (local 'script')",
+]
+bad_sample = "syntax error near end"
+ok = all(is_unsupported_embedded_regression_error(item) for item in samples)
+ok = ok and not is_unsupported_embedded_regression_error(bad_sample)
+raise SystemExit(0 if ok else 1)
+'@
+    $classifierOutput = $classifierCheck | & python -B - $ExtractPath 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Add-CheckLine -Status "OK" -Message "embedded regression classifier check passed"
+    } else {
+        Add-CheckLine -Status "FAIL" -Message ("embedded regression classifier check failed: {0}" -f ($classifierOutput | Out-String))
+    }
+
+    $zipItem = Get-Item -LiteralPath $ZipPath
+    $report.Insert(0, ("ReleaseSelfTest: {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))) | Out-Null
+    $report.Insert(1, "ZipPath: $ZipPath") | Out-Null
+    $report.Insert(2, ("ZipSize: {0}" -f $zipItem.Length)) | Out-Null
+    $report.Insert(3, "") | Out-Null
+    $report | Set-Content -LiteralPath $ReportPath -Encoding UTF8
+
+    Remove-PythonCaches -RootPath $ExtractPath
+    Remove-PathWithRetry -TargetPath $ExtractPath
+
+    if ($errors.Count -gt 0) {
+        throw "Release self-test failed. See: $ReportPath"
+    }
+
+    Write-Host "[release-selftest] passed: $ReportPath"
+}
+
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 $env:PYTHONDONTWRITEBYTECODE = "1"
@@ -128,6 +292,8 @@ $releasePortableWork = Join-Path $releaseBuildDir "build_onefile"
 $stageDir = Join-Path $releaseDir "_stage_$timestamp"
 $stageAppDir = Join-Path $stageDir "SkillWriterDesktop"
 $manifestPath = Join-Path $stageDir "RELEASE_NOTES.txt"
+$selfTestDir = Join-Path $releaseDir "_selftest_$timestamp"
+$selfTestReportPath = Join-Path $releaseDir "SkillWriterDesktop_$timestamp.selftest.txt"
 
 Write-Host "[release] project root: $projectRoot"
 
@@ -138,7 +304,7 @@ if (-not $SkipBuild) {
         throw "Failed to sync bundled Codex skills"
     }
 
-    python -B -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)"
+    python -B -m PyInstaller --version *> $null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[release] PyInstaller not found, installing from requirements-build.txt"
         python -m pip install -r (Join-Path $projectRoot "requirements-build.txt")
@@ -186,6 +352,7 @@ New-Item -ItemType Directory -Path $stageDir | Out-Null
 Copy-Item -LiteralPath $appDir -Destination $stageAppDir -Recurse -Force
 Copy-Item -LiteralPath $portableExePath -Destination (Join-Path $stageDir "SkillWriterDesktopPortable.exe") -Force
 Copy-RuntimeAssets -RootPath $projectRoot -TargetPath $stageDir
+New-LauncherBat -AppDir $stageAppDir
 New-ReleaseManifest -AppDir $stageAppDir -ZipName $zipName -OutputPath $manifestPath
 
 if ((Test-Path -LiteralPath $zipPath) -and -not $KeepExistingZip) {
@@ -220,12 +387,17 @@ $hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
 $hashPath = "$zipPath.sha256.txt"
 "$($hash.Hash)  $zipName" | Set-Content -LiteralPath $hashPath -Encoding ASCII
 
+Write-Host "[release-selftest] extracting and validating release zip"
+Test-ReleasePackage -ZipPath $zipPath -ExtractPath $selfTestDir -ReportPath $selfTestReportPath
+
 Remove-PythonCaches -RootPath $projectRoot
 Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build")
 Remove-PathWithRetry -TargetPath (Join-Path $projectRoot "build_onefile")
 Remove-PathWithRetry -TargetPath $releaseBuildDir
+Remove-PathWithRetry -TargetPath $selfTestDir
 Remove-PathWithRetry -TargetPath $stageDir
 
 Write-Host "[release] done"
 Write-Host "[release] zip: $zipPath"
 Write-Host "[release] sha256: $hashPath"
+Write-Host "[release] selftest: $selfTestReportPath"
