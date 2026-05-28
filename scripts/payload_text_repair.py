@@ -144,6 +144,18 @@ def _load_skill_meta(task_dir: Path) -> dict[int, dict[str, str]]:
         meta = _parse_skill_meta(text)
         if meta:
             return meta
+    for path in (
+        task_dir / "task_handoff.md",
+        task_dir / "logs" / "last_codex_prompt.txt",
+        task_dir / "logs" / "last_model_message.txt",
+    ):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        meta = _parse_skill_meta(text)
+        if meta:
+            return meta
     return {}
 
 

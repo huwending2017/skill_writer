@@ -31,6 +31,19 @@ class CodexRunner:
         r"^[A-Za-z]:\\.+\.(lua|py|json|md|txt|xlsx?|csv):\d+(?::\d+)?:",
         re.IGNORECASE,
     )
+    DIAGNOSTIC_TOKENS = (
+        "error:",
+        "unauthorized",
+        "incorrect api key",
+        "authentication required",
+        "not logged in",
+        "unsupported model",
+        "model not found",
+        "rate limit",
+        "reconnecting",
+        "timed out",
+        "connection refused",
+    )
 
     def __init__(self) -> None:
         self.process: Optional[subprocess.Popen[bytes]] = None
@@ -38,6 +51,17 @@ class CodexRunner:
         self.last_resolved_executable: str = ""
         self.started_monotonic: float = 0.0
         self.last_output_monotonic: float = 0.0
+        self.last_session_id: str = ""
+        self.last_session_file: str = ""
+        self.last_output_excerpt: list[str] = []
+        self.last_diagnostic_lines: list[str] = []
+
+    def _reset_run_state(self) -> None:
+        self.last_error_message = ""
+        self.last_session_id = ""
+        self.last_session_file = ""
+        self.last_output_excerpt = []
+        self.last_diagnostic_lines = []
 
     def _windows_subprocess_kwargs(self) -> dict:
         return windows_subprocess_kwargs()
@@ -72,6 +96,24 @@ class CodexRunner:
     def resolve_executable(self, preferred_path: str = "") -> str:
         self.last_resolved_executable = resolve_codex_executable(preferred_path)
         return self.last_resolved_executable
+
+    def login_status(self, executable_path: str = "") -> str:
+        command = [self.resolve_executable(executable_path), "login", "status"]
+        try:
+            proc = subprocess.run(
+                normalize_windows_script_command(command),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=12,
+                env=self._subprocess_env(),
+                **self._windows_subprocess_kwargs(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"failed to query login status: {exc}"
+        output = decode_process_output(proc.stdout or b"").strip()
+        if output:
+            return output.splitlines()[0].strip()
+        return f"login status exited with code {proc.returncode}"
 
     def build_command(
         self,
@@ -233,6 +275,34 @@ class CodexRunner:
             log_queue.put(f"[codex-output] 已折叠 {folded_line_count} 行{label}")
         return 0
 
+    def _record_output_line(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        self.last_output_excerpt.append(stripped)
+        if len(self.last_output_excerpt) > 80:
+            self.last_output_excerpt = self.last_output_excerpt[-80:]
+        lowered = stripped.lower()
+        if any(token in lowered for token in self.DIAGNOSTIC_TOKENS):
+            if stripped not in self.last_diagnostic_lines:
+                self.last_diagnostic_lines.append(stripped)
+                if len(self.last_diagnostic_lines) > 20:
+                    self.last_diagnostic_lines = self.last_diagnostic_lines[-20:]
+
+    def build_diagnostic_summary(self, executable_path: str = "") -> list[str]:
+        lines = list(self.last_diagnostic_lines[-8:])
+        if self.last_session_id:
+            lines.append(f"session id: {self.last_session_id}")
+        if self.last_session_file:
+            lines.append(f"session file: {self.last_session_file}")
+        if not lines and self.last_output_excerpt:
+            lines.extend(self.last_output_excerpt[-6:])
+        if not lines:
+            status = self.login_status(executable_path)
+            if status:
+                lines.append(f"login status: {status}")
+        return lines
+
     def run_codex(
         self,
         prompt: str,
@@ -251,7 +321,7 @@ class CodexRunner:
         if self.is_running():
             raise RuntimeError("当前已有 Codex 任务正在运行")
 
-        self.last_error_message = ""
+        self._reset_run_state()
         self.started_monotonic = time.monotonic()
         self.last_output_monotonic = self.started_monotonic
         if resume_session_id or resume_last:
@@ -314,6 +384,8 @@ class CodexRunner:
                         started_scan_at,
                     )
                     if detected_session_id:
+                        self.last_session_id = detected_session_id
+                        self.last_session_file = session_file
                         if on_session_detected:
                             on_session_detected(detected_session_id, session_file)
                         break
@@ -346,13 +418,17 @@ class CodexRunner:
                     last_output_at = time.monotonic()
                     self.last_output_monotonic = last_output_at
                     output_line = decode_process_output(raw_line).rstrip("\r\n")
+                    self._record_output_line(output_line)
                     if not detected_session_id:
                         detected_session_id, session_file = self.find_latest_session_for_workspace(
                             workspace_root,
                             started_scan_at,
                         )
-                        if detected_session_id and on_session_detected:
-                            on_session_detected(detected_session_id, session_file)
+                        if detected_session_id:
+                            self.last_session_id = detected_session_id
+                            self.last_session_file = session_file
+                            if on_session_detected:
+                                on_session_detected(detected_session_id, session_file)
                     if self._should_fold_verbose_stdout_line(output_line):
                         folded_line_count += 1
                         stripped = output_line.strip()
@@ -379,8 +455,11 @@ class CodexRunner:
                         workspace_root,
                         started_scan_at,
                     )
-                    if detected_session_id and on_session_detected:
-                        on_session_detected(detected_session_id, session_file)
+                    if detected_session_id:
+                        self.last_session_id = detected_session_id
+                        self.last_session_file = session_file
+                        if on_session_detected:
+                            on_session_detected(detected_session_id, session_file)
             except Exception as exc:  # noqa: BLE001
                 self.last_error_message = str(exc)
                 log_queue.put(f"[codex-error] {exc}")

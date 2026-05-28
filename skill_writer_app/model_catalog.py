@@ -214,7 +214,7 @@ MODEL_PRESET_BY_KEY: Dict[str, ModelPreset] = {preset.key: preset for preset in 
 
 PROFILE_SHORTCUTS: List[ProfileShortcut] = [
     ProfileShortcut("clear", "清空", "", "清空额外参数"),
-    ProfileShortcut("openai", "OpenAI", "", "OpenAI 原生通常无需额外 profile"),
+    ProfileShortcut("openai", "OpenAI", '-c model_provider="openai"', "强制走 OpenAI provider，避免被全局 custom provider 覆盖"),
     ProfileShortcut("anthropic", "Anthropic", "-p anthropic", "通过 Codex profile 接 Anthropic"),
     ProfileShortcut("gemini", "Gemini", "-p gemini", "通过 Codex profile 接 Google Gemini"),
     ProfileShortcut("deepseek", "DeepSeek", "-p deepseek", "通过 Codex profile 接 DeepSeek"),

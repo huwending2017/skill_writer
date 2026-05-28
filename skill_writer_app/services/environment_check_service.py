@@ -92,6 +92,14 @@ class EnvironmentCheckService:
             return CheckItem("Python", False, "未找到 python；请在工具里配置本机 Python 路径")
         return self.check_command("Python", command, ["--version"])
 
+    def check_codex_login_status(self, command: str) -> CheckItem:
+        command = command.strip()
+        if not command:
+            command = shutil.which("codex") or ""
+        if not command:
+            return CheckItem("Codex login", False, "鏈壘鍒?Codex CLI")
+        return self.check_command("Codex login", command, ["login", "status"])
+
     def resolve_python(self, executable: str) -> str:
         command = executable.strip()
         if command:

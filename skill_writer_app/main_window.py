@@ -138,6 +138,14 @@ class SkillWriterApp:
         "当前工作目录下未识别到",
     )
     REPAIR_TEXT_SUFFIXES = {".txt", ".log", ".md", ".json", ".lua", ".csv"}
+    DEVELOP_AUTO_RETRY_BLOCKING_TOKENS = (
+        "401 unauthorized",
+        "incorrect api key",
+        "authentication required",
+        "unsupported model",
+        "model not found",
+        "not logged in",
+    )
     REPAIR_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
     SKILL_EXCEL_NAME = "J_技能表_skill.xlsx"
     WAR_EXCEL_NAME = "Z_战报表.xlsx"
@@ -173,6 +181,10 @@ class SkillWriterApp:
             str(family_skill_path / "scripts" / "write_temp_skill_excel.py")
         )
         self.settings = self.settings_service.load()
+        self.startup_model_repair_messages: list[str] = []
+        self.settings, self.startup_model_repair_messages = self.normalize_model_settings(self.settings)
+        if self.startup_model_repair_messages:
+            self.settings_service.save(self.settings)
         self.settings.last_output_file = str(self.default_output_file())
         self.log_queue: queue.Queue[str] = queue.Queue()
 
@@ -307,6 +319,8 @@ class SkillWriterApp:
         self.update_step_overview_visibility()
         self.update_workbench_advanced_visibility()
         self.load_initial_content()
+        for message in self.startup_model_repair_messages:
+            self.append_log(f"[workflow-resume] {message}")
         self.refresh_history_view()
         self.refresh_battle_root()
         self.restore_active_task_selection()
@@ -324,11 +338,88 @@ class SkillWriterApp:
     def get_preset_label(self, key: str) -> str:
         return get_preset(key).label
 
+    def infer_model_vendor(self, model_name: str) -> str:
+        lowered = model_name.strip().lower()
+        if not lowered:
+            return ""
+        if lowered in {"sonnet", "opus", "haiku"} or lowered.startswith("claude"):
+            return "Anthropic"
+        if lowered.startswith("gpt-") or lowered.startswith(("o1", "o3", "o4")) or "codex" in lowered:
+            return "OpenAI"
+        if lowered.startswith("gemini"):
+            return "Google"
+        if lowered.startswith("deepseek"):
+            return "DeepSeek"
+        if lowered.startswith("kimi") or lowered.startswith("moonshot"):
+            return "Moonshot AI"
+        if lowered.startswith("grok"):
+            return "xAI"
+        return "Unknown"
+
+    def normalize_model_settings(self, settings: AppSettings) -> tuple[AppSettings, list[str]]:
+        normalized = replace(settings)
+        changes: list[str] = []
+        preset = get_preset(normalized.model_preset_key)
+        backend = (normalized.agent_backend or "codex").strip() or "codex"
+
+        if backend == "claude":
+            if preset.vendor == "Anthropic" and not normalized.claude_model.strip():
+                normalized.claude_model = preset.model_name or "sonnet"
+                changes.append(f"检测到 Claude 模型为空，已按预设补全为 {normalized.claude_model}。")
+            return normalized, changes
+
+        current_model = normalized.codex_model.strip()
+        expected_model = preset.model_name.strip()
+        current_vendor = self.infer_model_vendor(current_model)
+
+        if not current_model and expected_model and preset.vendor != "Anthropic":
+            normalized.codex_model = expected_model
+            current_model = expected_model
+            current_vendor = self.infer_model_vendor(current_model)
+            changes.append(f"检测到 Codex 模型为空，已按预设补全为 {expected_model}。")
+
+        if preset.vendor == "OpenAI" and expected_model and current_vendor not in {"", "OpenAI", "Unknown"}:
+            normalized.codex_model = expected_model
+            changes.append(
+                f"检测到 Codex 当前模型 {current_model} 与 OpenAI 预设 {preset.label} 冲突，已自动修正为 {expected_model}。"
+            )
+
+        return normalized, changes
+
+    def apply_runtime_model_settings(self, settings: AppSettings) -> None:
+        self.agent_backend_var.set(settings.agent_backend or "codex")
+        self.model_preset_key_var.set(settings.model_preset_key)
+        self.model_preset_label_var.set(self.get_preset_label(settings.model_preset_key))
+        self.codex_model_var.set(settings.codex_model)
+        self.codex_extra_args_var.set(settings.codex_extra_args)
+        self.claude_model_var.set(settings.claude_model)
+        self.claude_extra_args_var.set(settings.claude_extra_args)
+
+    def repair_runtime_model_selection(self) -> list[str]:
+        normalized, changes = self.normalize_model_settings(self.collect_settings())
+        if not changes:
+            return []
+        self.apply_runtime_model_settings(normalized)
+        self.settings = normalized
+        self.settings_service.save(self.settings)
+        self.refresh_model_note()
+        self.refresh_command_preview()
+        return changes
+
     def default_output_file(self) -> Path:
-        return self.output_file_for_task()
+        settings = getattr(self, "settings", None)
+        return self.output_file_for_task(getattr(settings, "last_task_dir", ""))
 
     def output_file_for_task(self, task_dir: str = "") -> Path:
-        candidate = task_dir.strip() or self.latest_task_dir_var.get().strip()
+        candidate = task_dir.strip()
+        if not candidate and hasattr(self, "latest_task_dir_var"):
+            try:
+                candidate = self.latest_task_dir_var.get().strip()
+            except Exception:  # noqa: BLE001
+                candidate = ""
+        if not candidate:
+            settings = getattr(self, "settings", None)
+            candidate = str(getattr(settings, "last_task_dir", "") or "").strip()
         if candidate:
             return Path(candidate) / "logs" / "last_model_message.txt"
         return self.data_dir / "last_codex_message.txt"
@@ -1651,6 +1742,7 @@ class SkillWriterApp:
                 self.environment_check_service.check_python(python_executable),
                 self.environment_check_service.check_python_dependencies(python_executable, auto_install=True),
                 self.environment_check_service.check_command("Codex CLI", codex_executable, ["--version"]),
+                self.environment_check_service.check_codex_login_status(codex_executable),
                 self.environment_check_service.check_command("Claude CLI", claude_executable, ["--version"]),
                 self.environment_check_service.check_path("工作区", workspace_root, must_be_dir=True),
                 self.environment_check_service.check_path("battle_root", battle_root, must_be_dir=True),
@@ -2277,7 +2369,7 @@ class SkillWriterApp:
 
         self.schedule_develop_watchdog()
 
-    def schedule_develop_auto_retry(self, reason: str) -> bool:
+    def schedule_develop_auto_retry(self, reason: str, force_fresh_session: bool = False) -> bool:
         target_key = self.current_active_task_key or self.current_target_key()
         if not target_key:
             return False
@@ -2297,7 +2389,7 @@ class SkillWriterApp:
 
         next_retry = retry_count + 1
         session_id = str(task_info.get("session_id", "") or "")
-        force_fresh_session = next_retry >= 2
+        force_fresh_session = force_fresh_session or next_retry >= 2
         retry_note = (
             f"[workflow-retry] 技能开发异常退出且暂未发现可用产物，"
             f"自动续接重试 {next_retry}/{max_retry_count}。"
@@ -2329,7 +2421,7 @@ class SkillWriterApp:
         self.status_var.set("自动续接技能开发")
         self.set_task_stage("自动续接开发")
         self.update_action_buttons()
-        self.root.after(1500, self.run_develop)
+        self.root.after(1500, lambda: self.run_develop(auto_retry=True))
         return True
 
     def recent_full_log_text(self, max_chars: int = 40000) -> str:
@@ -2375,6 +2467,21 @@ class SkillWriterApp:
                 break
         if compact_lines:
             self.append_log("[workflow-diagnose] 模型最后输出摘要:\n" + "\n".join(compact_lines))
+
+    def append_backend_failure_diagnostics(self) -> None:
+        if self.agent_backend_var.get().strip() != "codex":
+            return
+        lines = self.codex_runner.build_diagnostic_summary(self.codex_executable_var.get().strip())
+        if not lines:
+            return
+        self.append_log("[workflow-diagnose] Codex 失败详情:\n" + "\n".join(lines))
+
+    def should_block_develop_auto_retry(self, reason: str) -> bool:
+        parts = [reason or "", self.last_task_error_message or ""]
+        if self.agent_backend_var.get().strip() == "codex":
+            parts.append("\n".join(self.codex_runner.build_diagnostic_summary(self.codex_executable_var.get().strip())))
+        lowered = "\n".join(part for part in parts if part).lower()
+        return any(token in lowered for token in self.DEVELOP_AUTO_RETRY_BLOCKING_TOKENS)
 
     def auto_repair_attempt_key(self, step_key: str) -> str:
         target = self.current_target_key()
@@ -4929,6 +5036,14 @@ class SkillWriterApp:
             self.append_log(
                 f"[workflow-resume] 修复任务后端已从 {entry.agent_backend or 'codex'} 切到 {self.agent_backend_var.get().strip() or 'codex'}，改用本地任务上下文接力。"
             )
+        model_repair_messages = self.repair_runtime_model_selection()
+        model_selection_repaired = bool(model_repair_messages)
+        for message in model_repair_messages:
+            self.append_log(f"[workflow-resume] {message}")
+        if model_selection_repaired:
+            same_backend = False
+            resume_session_id = ""
+            resume_last = False
         self.save_settings()
         self.current_task_name = "续接修复"
         self.current_active_task_key = active_key
@@ -5390,7 +5505,7 @@ class SkillWriterApp:
             script_name="run_local_skill_compile.py",
         )
 
-    def run_develop(self) -> None:
+    def run_develop(self, auto_retry: bool = False) -> None:
         state = self.build_workflow_state()
         if not state["can_develop"]:
             messagebox.showwarning("提示", str(state["next_message"]))
@@ -5403,6 +5518,10 @@ class SkillWriterApp:
             return
         if state.get("requirement_changed"):
             self.sync_changed_requirement_to_current_task()
+        model_repair_messages = self.repair_runtime_model_selection()
+        model_selection_repaired = bool(model_repair_messages)
+        for message in model_repair_messages:
+            self.append_log(f"[workflow-resume] {message}")
         resume_match = self.find_resumable_develop_task(prompt)
         resume_key = ""
         resume_session_id = ""
@@ -5413,6 +5532,8 @@ class SkillWriterApp:
             previous_backend = str(resume_info.get("agent_backend", "") or "codex")
             current_backend = self.agent_backend_var.get().strip() or "codex"
             force_fresh_session = bool(resume_info.get("force_fresh_session"))
+            if model_selection_repaired:
+                force_fresh_session = True
             if force_fresh_session:
                 resume_session_id = ""
                 resume_last = False
@@ -5468,6 +5589,12 @@ class SkillWriterApp:
             prompt=prompt,
             resumed_from=resume_session_id,
         )
+        if not auto_retry and active_key:
+            self.active_task_service.update(
+                active_key,
+                develop_auto_retry_count=0,
+                last_develop_failure="",
+            )
         self.current_task_started_at = datetime.now()
         self.status_var.set(f"{self.current_backend_label()} 开发中")
         self.set_task_stage("代码审计 / 生成中")
@@ -5689,8 +5816,26 @@ class SkillWriterApp:
             else:
                 self.append_log(f"[workflow-fallback] 未检测到可继续的开发产物: {reason}")
                 self.append_last_model_output_summary(reason)
+                self.append_backend_failure_diagnostics()
                 retry_reason = self.last_task_error_message or reason
-                if self.schedule_develop_auto_retry(retry_reason):
+                repair_messages = self.repair_runtime_model_selection()
+                for message in repair_messages:
+                    self.append_log(f"[workflow-retry] {message}")
+                if self.should_block_develop_auto_retry(retry_reason):
+                    self.append_log(
+                        "[workflow-retry] 已识别为认证或模型配置类失败，本次不再自动续接。修复登录或 provider 配置后，可以直接在原任务上重试。"
+                    )
+                    if self.current_active_task_key:
+                        self.active_task_service.update(
+                            self.current_active_task_key,
+                            status="interrupted",
+                            step="develop",
+                            task_name="技能开发",
+                            last_develop_failure=retry_reason,
+                            force_fresh_session=True,
+                        )
+                        self.write_task_handoff(status="interrupted", current_step="develop")
+                elif self.schedule_develop_auto_retry(retry_reason, force_fresh_session=bool(repair_messages)):
                     return
         if code != 0 and step_key == "audit" and self.should_auto_repair_after_audit_failure():
             retry_reason = "本地预审发现 temp_excel_payload.json 无有效 rows，已自动回到技能开发补齐配置产物。"
@@ -5857,7 +6002,14 @@ class SkillWriterApp:
         if not task_dir.exists() or not battle_root.exists():
             return []
 
-        candidate_roots = [task_dir / "scripts", task_dir]
+        candidate_roots = [
+            task_dir / "scripts",
+            task_dir / "actions",
+            task_dir / "buffs",
+            task_dir / "scripts" / "actions",
+            task_dir / "scripts" / "buffs",
+            task_dir,
+        ]
         targets: list[tuple[Path, Path]] = []
         seen: set[str] = set()
         for root in candidate_roots:
