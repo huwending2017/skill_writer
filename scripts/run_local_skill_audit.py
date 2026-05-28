@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from payload_compiler import expand_payload_rows
+from payload_text_repair import auto_repair_payload_text_fields
 from skill_artifact_utils import (
     IMPLEMENTATION_NAME,
     TEMP_CONFIG_NAME,
+    VALID_SKILL_TYPES,
     audit_lua_chinese_comments,
     collect_task_lua_scripts,
     existing_action_paths,
@@ -19,6 +22,7 @@ from skill_artifact_utils import (
     find_suspicious_question_mark_fields,
     ensure_payload_rows,
     is_task_owned_lua_script,
+    is_safe_war_paper_name,
     load_json,
     normalize_excel_config_payload,
     resolve_task_context,
@@ -27,6 +31,25 @@ from skill_artifact_utils import (
 FORBIDDEN_RUNTIME_REFERENCES = ("test_skill_temp", "temp_skill_workspace", "roll_skill_dice")
 NON_PRODUCTION_LUA_NAMES = {"test_skill_temp.lua", "test_runtime_validation.lua", "temp_skill_config.lua"}
 TEST_LUA_PREFIXES = ("test_", "regression_", "mechanism_")
+PROTECTED_RUNTIME_RELATIVE_PATHS = (
+    "module/object/actor.lua",
+    "module/fight/skill.lua",
+    "module/fight/buff.lua",
+    "module/fight/action.lua",
+    "module/fight/damage.lua",
+    "module/scene/battle_scene.lua",
+)
+
+
+def is_blocking_comment_audit_error(message: str) -> bool:
+    """Only block on comment-audit findings that indicate executable risk."""
+
+    blocking_tokens = (
+        "??",
+        "debug_log",
+        "extern.overlying",
+    )
+    return any(token in message for token in blocking_tokens)
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,9 +65,53 @@ def _format_paths(paths: list[Path]) -> str:
     return ", ".join(str(path) for path in paths)
 
 
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def audit_protected_runtime_files(battle_root: Path, task_dir: Path) -> list[str]:
+    state_path = task_dir / "task_state.json"
+    if not state_path.exists():
+        return []
+    try:
+        state = load_json(state_path)
+    except (OSError, json.JSONDecodeError):
+        return []
+    baseline = state.get("protected_runtime_baseline")
+    if not isinstance(baseline, dict) or not baseline:
+        return []
+
+    protected_paths = state.get("protected_runtime_paths")
+    if not isinstance(protected_paths, list) or not protected_paths:
+        protected_paths = list(PROTECTED_RUNTIME_RELATIVE_PATHS)
+
+    errors: list[str] = []
+    for relative_path in protected_paths:
+        relative_text = str(relative_path).replace("\\", "/").strip("/")
+        if not relative_text:
+            continue
+        expected_hash = baseline.get(relative_text) or baseline.get(str(relative_path))
+        if not expected_hash:
+            continue
+        path = battle_root / Path(relative_text)
+        if not path.exists() or not path.is_file():
+            errors.append(f"protected runtime file missing after task started: {relative_text}")
+            continue
+        try:
+            current_hash = sha256_file(path)
+        except OSError as exc:
+            errors.append(f"protected runtime file cannot be read: {relative_text} ({exc})")
+            continue
+        if current_hash != expected_hash:
+            errors.append(
+                f"禁止修改底层战斗框架文件: {relative_text}。续写/修复技能只能修改任务目录产物或用户明确点名的技能脚本。"
+            )
+    return errors
+
+
 def is_generated_skill_script(path: Path) -> bool:
     try:
-        head = path.read_text(encoding="utf-8")[:4096]
+        head = path.read_text(encoding="utf-8", errors="replace")[:4096]
     except OSError:
         return False
     return "author: codex" in head.lower() or "debug_log(" in head
@@ -123,7 +190,11 @@ def audit_payload_rows(payload: dict[str, Any], battle_root: Path, task_dir: Pat
         for path in sorted(comment_checked_paths):
             comment_errors = audit_lua_chinese_comments(path)
             if comment_errors:
-                errors.extend(comment_errors)
+                for item in comment_errors:
+                    if is_blocking_comment_audit_error(item):
+                        errors.append(item)
+                    else:
+                        warnings.append(item)
             else:
                 print(f"[audit] chinese_comments: ok :: {path}")
 
@@ -143,6 +214,22 @@ def audit_payload_shape(payload: dict[str, Any]) -> list[str]:
             continue
         skill_id = int(row.get("id", -1))
         level = int(row.get("skill_lv", -1))
+        row_key = row.get("key") or f"{skill_id}_{level}"
+        if not str(row.get("desc") or "").strip():
+            errors.append(f"skill[{row_key}] 缺少 desc，正式 skill 表描述不能为空")
+        if not str(row.get("de_desc") or "").strip():
+            errors.append(f"skill[{row_key}] 缺少 de_desc，正式 skill 表详细描述不能为空")
+        skill_type_value = row.get("skill_type")
+        if skill_type_value not in (None, ""):
+            try:
+                skill_type = int(skill_type_value)
+            except (TypeError, ValueError):
+                errors.append(f"skill[{row_key}] skill_type 非数字: {skill_type_value}")
+            else:
+                if skill_type not in VALID_SKILL_TYPES:
+                    errors.append(
+                        f"skill[{row_key}] skill_type={skill_type} 不在当前正式表允许值 {sorted(VALID_SKILL_TYPES)} 中，禁止写入"
+                    )
         skill_levels.setdefault(skill_id, set()).add(level)
         skill_max[skill_id] = max(skill_max.get(skill_id, -1), int(row.get("max_lv", level)))
         expected_key = f"{skill_id}_{level}"
@@ -162,6 +249,8 @@ def audit_payload_shape(payload: dict[str, Any]) -> list[str]:
         skill_id = int(row.get("skill_id", -1))
         stage = int(row.get("stage", row.get("id", -1)))
         level = int(row.get("skill_level", -1))
+        if stage <= 0:
+            errors.append(f"skill_stage 阶段 id 非法: skill_id={skill_id} level={level} stage={stage}")
         stage_levels.setdefault((skill_id, stage), set()).add(level)
         expected_key = f"{skill_id}_{stage}_{level}"
         if str(row.get("key", expected_key)) != expected_key:
@@ -199,9 +288,19 @@ def audit_payload_shape(payload: dict[str, Any]) -> list[str]:
 def audit_war_report_config_contract(rows: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     explicit_war_ids: set[int] = set()
-    for row in rows.get("war_paper", []):
+    for index, row in enumerate(rows.get("war_paper", []), start=1):
         if not isinstance(row, dict):
             continue
+        row_key = row.get("name") or row.get("ID") or row.get("id") or index
+        name = str(row.get("name") or "").strip()
+        if not name:
+            errors.append(f"war_paper[{index}] 缺少 name；name 必须是英文枚举名，中文只能写 desc1")
+        elif not is_safe_war_paper_name(name):
+            errors.append(
+                f"war_paper[{index}] name={name} 非法；禁止中文或空格，必须是 data_war_paper.<name> 可用的英文/数字/下划线枚举名"
+            )
+        if not str(row.get("desc1") or "").strip():
+            errors.append(f"war_paper[{index}] key={row_key} 缺少 desc1；战报正文必须写入 desc1，不能只依赖空白字段")
         for field in ("ID", "id", "record_id"):
             value = row.get(field)
             if value in (None, ""):
@@ -258,7 +357,7 @@ def audit_production_script_contract(paths: list[Path]) -> list[str]:
     for path in paths:
         if is_non_production_lua(path):
             continue
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
         for marker in FORBIDDEN_RUNTIME_REFERENCES:
             if marker in text:
                 errors.append(f"{path.name} 生产脚本禁止依赖临时实现: {marker}")
@@ -285,7 +384,7 @@ def audit_command_skill_notes(payload: dict[str, Any], implementation_path: Path
         return []
     if not implementation_path.exists():
         return ["指挥技能缺少 IMPLEMENTATION.md，无法确认失效/恢复场景已分析"]
-    text = implementation_path.read_text(encoding="utf-8")
+    text = implementation_path.read_text(encoding="utf-8", errors="replace")
     if "失效" not in text or "恢复" not in text:
         return ["指挥技能的 IMPLEMENTATION.md 必须说明失效与恢复场景"]
     return []
@@ -361,6 +460,7 @@ def main() -> int:
 
     errors: list[str] = []
     warnings: list[str] = []
+    errors.extend(audit_protected_runtime_files(ctx.battle_root, ctx.task_dir))
 
     if ctx.payload_path is None or not ctx.payload_path.exists():
         errors.append("缺少 temp_excel_payload.json")
@@ -368,6 +468,9 @@ def main() -> int:
         payload = normalize_excel_config_payload(ensure_payload_rows(load_json(ctx.payload_path)))
         if isinstance(payload.get("rows"), dict):
             payload = expand_payload_rows(payload)
+        payload, repair_notes = auto_repair_payload_text_fields(payload, ctx.task_dir)
+        for item in repair_notes:
+            print(f"[audit-repair] {item}")
         ctx.payload_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -389,9 +492,9 @@ def main() -> int:
         errors.extend(payload_errors)
         warnings.extend(payload_warnings)
         errors.extend(audit_payload_shape(payload))
-        errors.extend(audit_command_skill_notes(payload, implementation))
+        warnings.extend(audit_command_skill_notes(payload, implementation))
         report_paths = sorted(set(task_owned_paths).union(task_lua_scripts))
-        errors.extend(audit_war_report_coverage_notes(payload, implementation, report_paths))
+        warnings.extend(audit_war_report_coverage_notes(payload, implementation, report_paths))
         errors.extend(audit_production_script_contract(sorted(task_owned_paths)))
 
     new_mechanism_files = [

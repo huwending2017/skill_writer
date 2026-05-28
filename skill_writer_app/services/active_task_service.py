@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from skill_writer_app.services.mojibake_repair import repair_tree
+from skill_writer_app.services.text_decode import read_json_file
 
 
 class ActiveTaskService:
@@ -15,7 +16,7 @@ class ActiveTaskService:
         if not self.state_path.exists():
             return {}
         try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            data = read_json_file(self.state_path)
         except json.JSONDecodeError:
             return {}
         if not isinstance(data, dict):

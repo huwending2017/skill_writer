@@ -35,10 +35,11 @@ from skill_writer_app.services.environment_check_service import EnvironmentCheck
 from skill_writer_app.services.excel_writeback import ExcelWritebackService
 from skill_writer_app.services.history_service import HistoryService
 from skill_writer_app.services.local_script_runner import LocalScriptRunner
+from skill_writer_app.services.lesson_service import LessonService
 from skill_writer_app.services.log_sanitizer import LogSanitizer
 from skill_writer_app.services.settings_service import SettingsService
 from skill_writer_app.services.task_handoff_service import TaskHandoffService
-from skill_writer_app.services.text_decode import decode_process_output
+from skill_writer_app.services.text_decode import decode_process_output, read_json_file, read_text_file
 from skill_writer_app.services.workflow_state_service import WorkflowStateService
 from skill_writer_app.services.workspace_manager import WorkspaceManager
 from skill_writer_app.templates import (
@@ -56,6 +57,14 @@ class SkillWriterApp:
     LOG_FLUSH_INTERVAL_MS = 1000
     LOG_MAX_LINES = 5000
     STATUS_TICK_MS = 1000
+    PROTECTED_RUNTIME_RELATIVE_PATHS = (
+        "module/object/actor.lua",
+        "module/fight/skill.lua",
+        "module/fight/buff.lua",
+        "module/fight/action.lua",
+        "module/fight/damage.lua",
+        "module/scene/battle_scene.lua",
+    )
     CORE_LOG_PREFIXES = (
         "[session]",
         "[workflow]",
@@ -114,6 +123,20 @@ class SkillWriterApp:
         "passed",
         "failed",
     )
+    AUTO_REPAIRABLE_STEPS = {"audit", "compile", "test", "preview", "copy", "real"}
+    AUTO_REPAIR_BLOCKING_TOKENS = (
+        "请先选择",
+        "payload 文件不存在",
+        "请选择有效的 temp_excel_payload.json",
+        "python executable not found",
+        "配置目录下未找到",
+        "battle_root 不存在",
+        "当前已有任务在执行",
+        "被其他进程锁定",
+        "Permission denied",
+        "拒绝访问",
+        "当前工作目录下未识别到",
+    )
     REPAIR_TEXT_SUFFIXES = {".txt", ".log", ".md", ".json", ".lua", ".csv"}
     REPAIR_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"}
     SKILL_EXCEL_NAME = "J_技能表_skill.xlsx"
@@ -135,6 +158,7 @@ class SkillWriterApp:
         self.skill_sync_results = self.bundled_skill_service.sync_all()
         self.settings_service = SettingsService(self.data_dir / "settings.json")
         self.history_service = HistoryService(self.data_dir / "history.json")
+        self.lesson_service = LessonService(self.data_dir / "skill_lessons.md")
         self.workflow_state_service = WorkflowStateService(self.data_dir / "workflow_state.json")
         self.active_task_service = ActiveTaskService(self.data_dir / "active_task_state.json")
         self.task_handoff_service = TaskHandoffService()
@@ -268,8 +292,11 @@ class SkillWriterApp:
         self.suppress_requirement_change: bool = False
         self.current_task_started_at: datetime | None = None
         self.current_active_task_key: str = ""
+        self.current_output_file_path: Path | None = None
         self.last_log_at: datetime | None = None
         self.develop_watchdog_after_id: str | None = None
+        self.auto_repair_context: dict[str, object] | None = None
+        self.auto_repair_attempts: dict[str, int] = {}
 
         self.build_ui()
         self.write_full_log(
@@ -298,7 +325,30 @@ class SkillWriterApp:
         return get_preset(key).label
 
     def default_output_file(self) -> Path:
+        return self.output_file_for_task()
+
+    def output_file_for_task(self, task_dir: str = "") -> Path:
+        candidate = task_dir.strip() or self.latest_task_dir_var.get().strip()
+        if candidate:
+            return Path(candidate) / "logs" / "last_model_message.txt"
         return self.data_dir / "last_codex_message.txt"
+
+    def current_output_file(self) -> Path:
+        if self.current_task_name and self.current_output_file_path:
+            return self.current_output_file_path
+        return self.default_output_file()
+
+    def read_output_text(self, task_dir: str = "", max_chars: int = 0, prefer_current: bool = False) -> str:
+        output_file = self.current_output_file() if prefer_current else self.output_file_for_task(task_dir)
+        if not output_file.exists():
+            return ""
+        try:
+            text = read_text_file(output_file).strip()
+        except Exception:  # noqa: BLE001
+            return ""
+        if max_chars and len(text) > max_chars:
+            return text[-max_chars:]
+        return text
 
     def migrate_legacy_app_data(self) -> None:
         legacy_items = [
@@ -1664,10 +1714,16 @@ class SkillWriterApp:
         return "Claude" if self.agent_backend_var.get() == "claude" else "Codex"
 
     def prompt_for_current_backend(self, prompt: str) -> str:
-        if self.agent_backend_var.get() != "claude":
-            return prompt
         skill_path = self.bundled_skill_service.bundled_skills_dir() / "family-battle-skill-writer" / "SKILL.md"
         normalized_prompt = prompt.replace("Use $family-battle-skill-writer\n\n", "", 1)
+        if self.agent_backend_var.get() != "claude":
+            return (
+                "Use $family-battle-skill-writer\n\n"
+                "如果当前 Codex 环境没有自动加载这个技能，必须先读取并遵守下面这个本地技能说明文件，"
+                "然后继续完成任务，不能因为技能未加载就只输出说明。\n"
+                f"技能说明文件: {skill_path}\n\n"
+                f"{normalized_prompt}"
+            )
         return (
             "先读取并严格遵守下面这个本地技能说明文件，然后再执行任务；"
             "不要把它当成普通参考资料跳过，也不要重新发明一套流程。\n"
@@ -1953,11 +2009,15 @@ class SkillWriterApp:
                     return text
             return ""
 
-        requirement = pick(
+        saved_requirement = pick(
             state.get("skill_description"),
             memory.get("requirement"),
             self.extract_markdown_section(handoff, "Original Requirement"),
         )
+        payload_requirement = self.build_requirement_from_task_payload(task_dir)
+        requirement = saved_requirement
+        if payload_requirement and not self.requirement_matches_payload(saved_requirement, payload_requirement):
+            requirement = payload_requirement
         constraints = pick(
             state.get("additional_constraints"),
             memory.get("constraints"),
@@ -1973,6 +2033,80 @@ class SkillWriterApp:
             "status": pick(state.get("status"), memory.get("status")),
         }
 
+    def build_requirement_from_task_payload(self, task_dir: str) -> str:
+        payload_path = self.workspace_manager.find_primary_payload_for_dir(task_dir)
+        if not payload_path or not Path(payload_path).exists():
+            return ""
+        try:
+            payload = read_json_file(Path(payload_path))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        rows = payload.get("rows")
+        if not isinstance(rows, dict):
+            return ""
+        skill_rows = rows.get("skill")
+        if not isinstance(skill_rows, list):
+            return ""
+
+        by_id: dict[str, dict[str, object]] = {}
+        for row in skill_rows:
+            if not isinstance(row, dict):
+                continue
+            skill_id = str(row.get("id") or "").strip()
+            if not skill_id:
+                continue
+            current = by_id.get(skill_id)
+            if current is None or int(row.get("skill_lv") or 0) > int(current.get("skill_lv") or 0):
+                by_id[skill_id] = row
+        if not by_id:
+            return ""
+
+        def sort_key(item: tuple[str, dict[str, object]]) -> tuple[int, str]:
+            skill_id, _row = item
+            return (int(skill_id) if skill_id.isdigit() else 10**12, skill_id)
+
+        blocks: list[str] = []
+        for skill_id, row in sorted(by_id.items(), key=sort_key):
+            name = str(row.get("name") or "").strip()
+            max_lv = str(row.get("max_lv") or row.get("skill_lv") or "").strip()
+            desc = str(row.get("de_desc") or row.get("desc") or "").strip()
+            skill_type = self.describe_skill_type(row.get("skill_type"))
+            block = [
+                f"技能id:{skill_id}",
+                f"技能类型:{skill_type}",
+            ]
+            if name:
+                block.append(f"技能名:{name}")
+            if max_lv:
+                block.append(f"技能最高等级:{max_lv}")
+            if desc:
+                block.append(f"技能描述:{desc}")
+            blocks.append("\n".join(block))
+        return "\n\n".join(blocks)
+
+    def describe_skill_type(self, value: object) -> str:
+        text = str(value or "").strip()
+        mapping = {
+            "1": "主动",
+            "2": "主动",
+            "3": "突击",
+            "4": "被动",
+            "5": "指挥",
+            "6": "兵书",
+            "7": "装备",
+        }
+        return mapping.get(text, text or "未填写")
+
+    def requirement_skill_ids(self, text: str) -> set[str]:
+        return set(re.findall(r"技能\s*id\s*[:：]\s*(\d+)", text or "", flags=re.IGNORECASE))
+
+    def requirement_matches_payload(self, saved_requirement: str, payload_requirement: str) -> bool:
+        payload_ids = self.requirement_skill_ids(payload_requirement)
+        if not payload_ids:
+            return True
+        saved_ids = self.requirement_skill_ids(saved_requirement)
+        return saved_ids == payload_ids
+
     def extract_markdown_section(self, text: str, heading: str) -> str:
         if not text:
             return ""
@@ -1986,6 +2120,22 @@ class SkillWriterApp:
         end = text.find("\n## ", start + 1)
         section = text[start:end if end >= 0 else len(text)].strip()
         return section
+
+    def remove_markdown_section(self, text: str, heading: str) -> str:
+        if not text:
+            return ""
+        marker = f"## {heading}"
+        start = text.find(marker)
+        if start < 0:
+            return text
+        end = text.find("\n## ", start + 1)
+        if end < 0:
+            return text[:start].rstrip()
+        prefix = text[:start].rstrip()
+        suffix = text[end + 1 :].lstrip()
+        if prefix and suffix:
+            return prefix + "\n\n" + suffix
+        return prefix or suffix
 
     def load_task_context_into_editor(self, task_dir: str) -> None:
         context = self.load_task_context(task_dir)
@@ -2005,9 +2155,13 @@ class SkillWriterApp:
             if context.get("requirement"):
                 self.description_text.delete("1.0", "end")
                 self.description_text.insert("1.0", context["requirement"])
+                self.description_text.mark_set("insert", "1.0")
+                self.description_text.see("1.0")
                 changed = True
             else:
                 self.description_text.delete("1.0", "end")
+                self.description_text.mark_set("insert", "1.0")
+                self.description_text.see("1.0")
                 changed = True
             if context.get("constraints"):
                 self.constraints_text.delete("1.0", "end")
@@ -2107,7 +2261,7 @@ class SkillWriterApp:
             self.payload_var.get().strip(),
         )
 
-        if usable and (running_seconds >= 480 or idle_seconds >= 180):
+        if usable and (running_seconds >= 300 or idle_seconds >= 90):
             self.append_log(
                 "[workflow-watchdog] 已检测到可用开发产物，模型进程长时间未结束，自动停止模型并继续后续流程。"
             )
@@ -2115,9 +2269,9 @@ class SkillWriterApp:
             runner.stop_running()
             return
 
-        if running_seconds >= 1800 and not usable:
-            self.last_task_error_message = "技能开发超过 30 分钟仍未生成可用产物，工具已自动停止本次任务。请简化描述或重新新建技能任务。"
-            self.append_log("[workflow-watchdog] 技能开发超过 30 分钟仍未生成可用产物，已自动停止。")
+        if running_seconds >= 1200 and not usable:
+            self.last_task_error_message = "技能开发超过 20 分钟仍未生成可用产物，工具已自动停止本次任务。请简化描述或重新新建技能任务。"
+            self.append_log("[workflow-watchdog] 技能开发超过 20 分钟仍未生成可用产物，已自动停止。")
             runner.stop_running()
             return
 
@@ -2134,7 +2288,7 @@ class SkillWriterApp:
             retry_count = int(task_info.get("develop_auto_retry_count", 0) or 0)
         except (TypeError, ValueError):
             retry_count = 0
-        max_retry_count = 4
+        max_retry_count = 2
         if retry_count >= max_retry_count:
             self.append_log(
                 f"[workflow-retry] 技能开发自动续接已达到上限 {max_retry_count} 次，本轮停止。"
@@ -2197,12 +2351,12 @@ class SkillWriterApp:
         return any(token in recent for token in known_payload_errors)
 
     def append_last_model_output_summary(self, reason: str) -> None:
-        output_file = self.default_output_file()
+        output_file = self.current_output_file()
         if not output_file.exists():
             self.append_log(f"[workflow-diagnose] {reason}；模型最后输出文件不存在: {output_file}")
             return
         try:
-            text = output_file.read_text(encoding="utf-8", errors="replace").strip()
+            text = read_text_file(output_file).strip()
         except Exception as exc:  # noqa: BLE001
             self.append_log(f"[workflow-diagnose] {reason}；读取模型最后输出失败: {exc}")
             return
@@ -2221,6 +2375,142 @@ class SkillWriterApp:
                 break
         if compact_lines:
             self.append_log("[workflow-diagnose] 模型最后输出摘要:\n" + "\n".join(compact_lines))
+
+    def auto_repair_attempt_key(self, step_key: str) -> str:
+        target = self.current_target_key()
+        if not target:
+            target = self.normalize_path(self.latest_task_dir_var.get()) or self.normalize_path(self.payload_var.get())
+        return f"{target}::{step_key}"
+
+    def clear_auto_repair_attempt(self, step_key: str) -> None:
+        if not step_key:
+            return
+        self.auto_repair_attempts.pop(self.auto_repair_attempt_key(step_key), None)
+
+    def should_auto_repair_failed_step(self, step_key: str, reason: str) -> bool:
+        if step_key not in self.AUTO_REPAIRABLE_STEPS:
+            return False
+        if not (self.latest_task_dir_var.get().strip() or self.payload_var.get().strip()):
+            return False
+        combined = f"{reason}\n{self.last_task_error_message}\n{self.recent_full_log_text(12000)}"
+        lowered = combined.lower()
+        if any(token.lower() in lowered for token in self.AUTO_REPAIR_BLOCKING_TOKENS):
+            return False
+        attempt_key = self.auto_repair_attempt_key(step_key)
+        return self.auto_repair_attempts.get(attempt_key, 0) < 2
+
+    def build_auto_repair_issue_text(self, task_name: str, step_key: str, reason: str) -> str:
+        log_excerpt = self.recent_full_log_text(16000).strip()
+        lines = [
+            "这是工具自动发起的一次续接修复，不是人工手动修复。",
+            f"失败步骤: {task_name}",
+            f"步骤 key: {step_key}",
+            f"失败原因: {reason or self.last_task_error_message or '日志中未提取到明确错误，请结合最近日志定位。'}",
+            "",
+            "目标：",
+            "1. 优先修复当前任务目录中的 payload、Lua、测试、说明文档或写回前置问题。",
+            "2. 修复完成后，应让刚刚失败的这一步能够直接重新执行通过。",
+            "3. 如果问题来自本地预审/编译/测试，请最小修复任务产物；如果问题来自预览/副本/正式写回，请修复导致写回失败的配置、战报、脚本或同步问题。",
+        ]
+        if log_excerpt:
+            lines.extend(
+                [
+                    "",
+                    "最近完整日志（尾部节选）：",
+                    "```text",
+                    log_excerpt[-16000:],
+                    "```",
+                ]
+            )
+        return "\n".join(lines)
+
+    def schedule_step_auto_repair(self, task_name: str, step_key: str, reason: str) -> bool:
+        if not self.should_auto_repair_failed_step(step_key, reason):
+            return False
+
+        entry = self.build_repair_entry_from_current_task()
+        if not entry:
+            return False
+
+        attempt_key = self.auto_repair_attempt_key(step_key)
+        next_retry = self.auto_repair_attempts.get(attempt_key, 0) + 1
+        self.auto_repair_attempts[attempt_key] = next_retry
+        self.auto_repair_context = {
+            "task_name": task_name,
+            "step_key": step_key,
+            "serial_active": self.serial_workflow_active,
+            "attempt_key": attempt_key,
+            "rerun_mode": (
+                "finalize_real_after_sync"
+                if step_key == "real" and "正式 Excel 写回成功" in (reason or "")
+                else "rerun_step"
+            ),
+        }
+
+        self.append_log(
+            f"[workflow-retry] 步骤“{task_name}”执行失败，启动自动修复 {next_retry}/2。"
+        )
+        self.append_log(f"[workflow-retry] 失败原因: {reason or self.last_task_error_message or 'unknown'}")
+
+        target_key = self.current_active_task_key
+        if target_key:
+            self.active_task_service.update(
+                target_key,
+                status="interrupted",
+                step=step_key,
+                task_name=task_name,
+                last_step_failure=reason or self.last_task_error_message or "",
+            )
+        self.write_task_handoff(status="interrupted", current_step=step_key, next_step=step_key)
+
+        self.current_task_name = ""
+        self.current_active_task_key = ""
+        self.current_task_started_at = None
+        self.status_var.set("自动修复中")
+        self.set_task_stage(f"自动修复 {task_name}")
+        self.update_action_buttons()
+
+        issue_text = self.build_auto_repair_issue_text(task_name, step_key, reason)
+        self.root.after(1200, lambda entry=entry, issue_text=issue_text: self.start_repair_fix(entry, issue_text, []))
+        return True
+
+    def run_step_by_key(self, step_key: str) -> None:
+        if step_key == "develop":
+            self.run_develop()
+        elif step_key == "audit":
+            self.run_local_audit()
+        elif step_key == "compile":
+            self.run_local_compile()
+        elif step_key == "test":
+            self.run_test()
+        elif step_key == "preview":
+            self.write_excel_dry_run()
+        elif step_key == "copy":
+            self.write_excel_copy()
+        elif step_key == "real":
+            self.write_excel_real()
+
+    def resume_after_real_writeback_repair(self, serial_from_repair: bool) -> None:
+        _, _, failed_sync = self.sync_task_production_lua()
+        if failed_sync:
+            self.last_task_error_message = "自动修复后，生产 Lua 仍未成功同步回工作目录，请查看 [finalize] 日志。"
+            detail = self.last_task_error_message + f"\n\n完整日志:\n{self.full_log_path}"
+            self.show_log_tab()
+            if serial_from_repair:
+                self.stop_serial_workflow("串行流程终止：正式写回后的自动修复仍未恢复。")
+                self.update_action_buttons()
+            messagebox.showwarning("提示", detail)
+            return
+
+        self.clear_auto_repair_attempt("real")
+        self.current_archive_dir = self.archive_current_task()
+        self.finalize_after_real_writeback()
+        self.append_log("[workflow-retry] 正式写回后的自动修复已完成，已继续执行同步与收尾。")
+        if serial_from_repair:
+            if self.serial_pending_steps and self.serial_pending_steps[0] == "real":
+                self.serial_pending_steps.pop(0)
+            self.stop_serial_workflow("串行流程已完成。")
+            self.update_action_buttons()
 
     def workflow_step_order(self) -> list[str]:
         return ["develop", "audit", "compile", "test", "preview", "copy", "real"]
@@ -2382,6 +2672,12 @@ class SkillWriterApp:
     def build_resume_develop_prompt(self, original_prompt: str, task_info: dict[str, object]) -> str:
         task_dir = str(task_info.get("task_dir", "") or self.latest_task_dir_var.get().strip())
         payload = str(task_info.get("payload_path", "") or self.payload_var.get().strip())
+        if task_dir:
+            canonical_payload = self.workspace_manager.canonical_task_file(task_dir, "temp_excel_payload.json")
+            payload_path = Path(payload) if payload else Path()
+            if not payload or not self.workspace_manager.task_dir_for_payload(payload_path) == Path(task_dir):
+                payload = str(canonical_payload)
+                self.payload_var.set(payload)
         previous_backend = str(task_info.get("agent_backend", "") or "未知")
         last_failure = str(task_info.get("last_develop_failure", "") or "")
         context_block = self.build_local_task_context_block(task_dir, payload)
@@ -2403,6 +2699,11 @@ class SkillWriterApp:
         payload = self.payload_var.get().strip()
         if not task_dir:
             return f"{self.build_develop_artifact_contract(task_dir, payload)}\n\n{original_prompt}"
+        canonical_payload = str(self.workspace_manager.canonical_task_file(task_dir, "temp_excel_payload.json"))
+        payload_path = Path(payload) if payload else Path()
+        if not payload or self.workspace_manager.task_dir_for_payload(payload_path) != Path(task_dir):
+            payload = canonical_payload
+            self.payload_var.set(payload)
         return (
             "本次是工具中已确认命名的一轮技能开发，请严格使用下面这个任务目录作为本次所有临时产物的管理目录。\n"
             "不要把本次产物写到其他旧任务目录，也不要复用其他技能任务的 payload、临时 Excel、测试文件或 repair 目录。\n"
@@ -2414,12 +2715,20 @@ class SkillWriterApp:
             f"{original_prompt}"
         )
 
+    def global_lessons_prompt_block(self) -> str:
+        lesson_service = getattr(self, "lesson_service", None)
+        if not lesson_service:
+            return ""
+        return lesson_service.prompt_block()
+
     def build_develop_artifact_contract(self, task_dir: str, payload: str, last_failure: str = "") -> str:
         payload_path = payload or (str(Path(task_dir) / "config" / "temp_excel_payload.json") if task_dir else "")
         lines = [
             "【硬性产物要求】",
             "本轮技能开发不是只做分析或给建议，必须直接写入本地文件。",
             "如果 $family-battle-skill-writer 技能未被当前模型环境正确加载，也必须按下面约定继续完成产物生成。",
+            "时间预算: 目标 20 分钟内完成全流程。前 5 分钟必须先生成最小可编译产物，后续再补充注释、战报和回归测试。",
+            "检索策略: 优先使用已有 task_handoff、task_memory、battle_knowledge_index 和少量精准搜索；禁止无目的全量扫描源码。",
             f"1. 必须创建或修复 payload 文件: {payload_path or '任务目录/config/temp_excel_payload.json'}",
             "2. payload 必须是 JSON 对象，且必须包含 rows 对象，结构至少如下:",
             '{"rows":{"skill":[],"skill_stage":[],"buff":[],"war_paper":[]}}',
@@ -2428,30 +2737,52 @@ class SkillWriterApp:
             "5. 结束前必须自查 payload.rows 是否存在且非空；如果没有生成，不允许结束。",
             "6. Lua 配置字段禁止输出 JSON/数组字面量，例如 [\"ATK\",10000]；应转换成 Excel/Lua 可识别的字符串格式。",
             "7. 新增/修改 Lua 必须包含关键中文注释和必要 DEBUG(...) 调试点。",
+            "8. 禁止修改 task_handoff.md、task_memory.json、task_state.json；这些任务状态文件只允许工具维护，模型只生成/修复 config、scripts、tests、docs 下的开发产物。",
+            "9. 必须只写入上面指定的任务目录，禁止创建同名乱码目录或把产物写入其他任务目录。",
+            "10. 续写/修复技能时禁止修改底层战斗框架文件，例如 module/object/actor.lua、module/fight/skill.lua、module/fight/buff.lua、module/fight/action.lua、module/fight/damage.lua、module/scene/battle_scene.lua；除非用户明确要求引擎级改造，否则只能改本次任务目录产物或用户点名的技能脚本。",
         ]
         if last_failure:
             lines.append(f"上一次失败原因: {last_failure}。本次必须优先修复这个失败原因。")
+        lessons = self.global_lessons_prompt_block()
+        if lessons:
+            lines.extend(["", lessons])
         return "\n".join(lines)
 
     def build_local_task_context_block(self, task_dir: str, payload: str) -> str:
         lines = ["本地任务接力上下文（优先依赖这些本地产物，而不是重新从 0 扫描）："]
-        handoff_text = self.task_handoff_service.read_handoff(task_dir)
+        lesson_service = getattr(self, "lesson_service", None)
+        if lesson_service:
+            lines.append(f"- 全局经验沉淀文件: {lesson_service.path}")
+        handoff_text = self.remove_markdown_section(
+            self.task_handoff_service.read_handoff(task_dir),
+            "Recent Model Output",
+        )
         if handoff_text:
+            selected_handoff_sections: list[str] = []
+            for heading in ("Original Requirement", "Constraints", "Resume Rules"):
+                section_body = self.extract_markdown_section(handoff_text, heading)
+                if section_body:
+                    selected_handoff_sections.extend([f"## {heading}", section_body])
             lines.extend(
                 [
                     "- 任务交接文件已存在，续接时必须优先读取并遵守:",
                     "```markdown",
-                    handoff_text[-8000:],
+                    "\n\n".join(selected_handoff_sections) if selected_handoff_sections else handoff_text[-4000:],
                     "```",
                 ]
             )
         memory = self.task_handoff_service.load_memory(task_dir)
         if memory:
+            memory_for_prompt = {
+                key: value
+                for key, value in memory.items()
+                if key not in {"recent_output_excerpt", "known_artifacts"}
+            }
             lines.extend(
                 [
                     "- 结构化任务记忆已存在，跨模型续接时优先遵守:",
                     "```json",
-                    json.dumps(memory, ensure_ascii=False, indent=2)[-8000:],
+                    json.dumps(memory_for_prompt, ensure_ascii=False, indent=2)[-8000:],
                     "```",
                 ]
             )
@@ -2463,22 +2794,16 @@ class SkillWriterApp:
                 lines.append("- 已有产物: " + ", ".join(artifact_names[:20]))
         if payload and Path(payload).exists():
             lines.append(f"- payload 已存在: {payload}")
-        output_file = self.default_output_file()
-        if output_file.exists():
-            try:
-                text = output_file.read_text(encoding="utf-8", errors="replace").strip()
-            except Exception:  # noqa: BLE001
-                text = ""
-            if text:
-                excerpt = text[-4000:]
-                lines.extend(
-                    [
-                        "- 上一次模型输出摘要:",
-                        "```text",
-                        excerpt,
-                        "```",
-                    ]
-                )
+        excerpt = self.read_output_text(task_dir, max_chars=4000)
+        if excerpt:
+            lines.extend(
+                [
+                    "- 上一次模型输出摘要:",
+                    "```text",
+                    excerpt,
+                    "```",
+                ]
+            )
         return "\n".join(lines)
 
     def task_step_labels(self) -> dict[str, str]:
@@ -2492,10 +2817,26 @@ class SkillWriterApp:
             "real": "写回正式 Excel",
         }
 
+    def protected_runtime_hashes(self, battle_root_value: str) -> dict[str, str]:
+        battle_root = Path(battle_root_value) if battle_root_value else None
+        if not battle_root:
+            return {}
+        result: dict[str, str] = {}
+        for relative_path in self.PROTECTED_RUNTIME_RELATIVE_PATHS:
+            path = battle_root / Path(relative_path)
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                result[relative_path] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                continue
+        return result
+
     def write_task_handoff(self, *, status: str, current_step: str = "", next_step: str = "") -> None:
         task_dir = self.latest_task_dir_var.get().strip()
         if not task_dir or not Path(task_dir).exists():
             return
+        existing_state = self.task_handoff_service.load_state(task_dir)
         flags = self.get_workflow_progress_flags()
         labels = self.task_step_labels()
         completed_steps = [labels[step] for step in self.workflow_step_order() if flags.get(step)]
@@ -2508,15 +2849,12 @@ class SkillWriterApp:
             else:
                 next_step = "已完成"
         artifacts = [str(path) for path in self.workspace_manager.find_task_artifacts(task_dir, limit=40)]
-        recent_output = ""
-        output_file = self.default_output_file()
-        if output_file.exists():
-            try:
-                recent_output = output_file.read_text(encoding="utf-8", errors="replace").strip()[-6000:]
-            except OSError:
-                recent_output = ""
+        recent_output = self.read_output_text(task_dir, max_chars=6000, prefer_current=True)
         settings = self.collect_settings()
         active_info = self.active_task_service.load().get(self.current_active_task_key, {}) if self.current_active_task_key else {}
+        protected_baseline = existing_state.get("protected_runtime_baseline")
+        if not isinstance(protected_baseline, dict) or not protected_baseline:
+            protected_baseline = self.protected_runtime_hashes(self.battle_root_var.get().strip())
         payload = {
             "status": status,
             "current_step": current_step,
@@ -2527,6 +2865,9 @@ class SkillWriterApp:
             "payload_path": self.payload_var.get().strip(),
             "agent_backend": settings.agent_backend,
             "model_name": settings.claude_model if settings.agent_backend == "claude" else settings.codex_model,
+            "global_lessons_path": str(self.lesson_service.path) if hasattr(self, "lesson_service") else "",
+            "protected_runtime_paths": list(self.PROTECTED_RUNTIME_RELATIVE_PATHS),
+            "protected_runtime_baseline": protected_baseline,
             "session_id": str(active_info.get("session_id", "") or ""),
             "completed_steps": completed_steps,
             "completed_step_keys": completed_step_keys,
@@ -2549,6 +2890,7 @@ class SkillWriterApp:
         prompt: str = "",
         resumed_from: str = "",
     ) -> None:
+        self.current_output_file_path = self.output_file_for_task(self.latest_task_dir_var.get().strip())
         self.active_task_service.upsert(
             target_key,
             {
@@ -2921,8 +3263,26 @@ class SkillWriterApp:
                 return False, "payload 未生成"
 
         try:
-            payload_data = json.loads(payload_path.read_text(encoding="utf-8"))
+            payload_data = read_json_file(payload_path)
             rows = payload_data.get("rows", {})
+            if not isinstance(rows, dict):
+                legacy_rows: dict[str, list] = {}
+                legacy_aliases = {
+                    "skill": ("skill", "data_skill"),
+                    "skill_stage": ("skill_stage", "data_skill_stage"),
+                    "buff": ("buff", "data_buff"),
+                    "war_paper": ("war_paper", "data_war_paper"),
+                }
+                for sheet_name, aliases in legacy_aliases.items():
+                    for alias in aliases:
+                        value = payload_data.get(alias)
+                        if isinstance(value, list):
+                            legacy_rows[sheet_name] = value
+                            break
+                        if isinstance(value, dict) and isinstance(value.get("rows"), list):
+                            legacy_rows[sheet_name] = value["rows"]
+                            break
+                rows = legacy_rows
             row_count = sum(len(rows.get(name, [])) for name in ("skill", "skill_stage", "buff", "war_paper"))
         except Exception:  # noqa: BLE001
             row_count = 0
@@ -3573,9 +3933,8 @@ class SkillWriterApp:
         if path.suffix.lower() != ".json":
             messagebox.showwarning("提示", "只有 JSON 文件才能作为 payload 使用")
             return
-        self.payload_var.set(str(path))
+        self.sync_payload_selection(str(path))
         self.status_var.set("已将选中文件设为 payload")
-        self.update_action_buttons()
 
     def refresh_history_view(self) -> None:
         self.history_entries = self.history_service.load()
@@ -4093,7 +4452,7 @@ class SkillWriterApp:
             codex_extra_args=self.claude_extra_args_var.get().strip() if self.agent_backend_var.get() == "claude" else self.codex_extra_args_var.get().strip(),
             payload_path=payload,
             task_dir=task_dir,
-            output_file=str(self.default_output_file()),
+            output_file=str(self.output_file_for_task(task_dir)),
             archive_dir="",
             skill_description=context.get("requirement") or self.get_text(self.description_text),
             protected_files=self.get_text(self.protected_text),
@@ -4432,6 +4791,7 @@ class SkillWriterApp:
         attachment_section = self.build_repair_attachment_section(attachments or [])
         local_context_root = entry.task_dir if entry.task_dir and Path(entry.task_dir).exists() else entry.archive_dir
         local_context = self.build_local_task_context_block(local_context_root, entry.payload_path)
+        lesson_context = self.global_lessons_prompt_block()
         return (
             "Use $family-battle-skill-writer\n\n"
             "这是针对已完成技能开发任务的续接修复。不要从 0 重新扫描或重新设计整套技能，"
@@ -4445,6 +4805,7 @@ class SkillWriterApp:
             f"原执行后端: {entry.agent_backend or 'codex'}\n"
             f"原 session: {entry.session_id or '未记录'}\n\n"
             f"{local_context}\n\n"
+            f"{lesson_context}\n\n"
             "用户反馈 / 日志 / 截图说明:\n"
             f"{issue_text.strip() or '用户未填写具体反馈，请先读取原任务产物和最近日志，找出明显异常后继续。'}\n\n"
             "附件 / 证据文件:\n"
@@ -4594,7 +4955,7 @@ class SkillWriterApp:
                 self.claude_runner.run_claude(
                     prompt=run_prompt,
                     workspace_root=self.workspace_var.get().strip(),
-                    output_file=str(self.default_output_file()),
+                    output_file=str(self.current_output_file()),
                     log_queue=self.log_queue,
                     on_complete=on_complete,
                     executable_path=self.claude_executable_var.get().strip(),
@@ -4612,7 +4973,7 @@ class SkillWriterApp:
                 self.codex_runner.run_codex(
                     prompt=run_prompt,
                     workspace_root=self.workspace_var.get().strip(),
-                    output_file=str(self.default_output_file()),
+                    output_file=str(self.current_output_file()),
                     log_queue=self.log_queue,
                     on_complete=on_complete,
                     executable_path=self.codex_executable_var.get().strip(),
@@ -4658,7 +5019,7 @@ class SkillWriterApp:
             codex_extra_args=settings.claude_extra_args if settings.agent_backend == "claude" else settings.codex_extra_args,
             payload_path=settings.payload_path,
             task_dir=settings.last_task_dir,
-            output_file=str(self.default_output_file()),
+            output_file=str(self.current_output_file()),
             archive_dir=self.current_archive_dir,
             skill_description=settings.skill_description,
             protected_files=settings.protected_files,
@@ -5122,7 +5483,7 @@ class SkillWriterApp:
                 self.claude_runner.run_claude(
                     prompt=run_prompt,
                     workspace_root=self.workspace_var.get().strip(),
-                    output_file=str(self.default_output_file()),
+                    output_file=str(self.current_output_file()),
                     log_queue=self.log_queue,
                     on_complete=on_complete,
                     executable_path=self.claude_executable_var.get().strip(),
@@ -5140,7 +5501,7 @@ class SkillWriterApp:
                 self.codex_runner.run_codex(
                     prompt=run_prompt,
                     workspace_root=self.workspace_var.get().strip(),
-                    output_file=str(self.default_output_file()),
+                    output_file=str(self.current_output_file()),
                     log_queue=self.log_queue,
                     on_complete=on_complete,
                     executable_path=self.codex_executable_var.get().strip(),
@@ -5287,7 +5648,24 @@ class SkillWriterApp:
         if remaining_safe_lines:
             self.append_log("\n".join(remaining_safe_lines) + "\n")
         step_key = self.task_name_to_step(task_name)
-        self.refresh_temp_workspace_views(force_latest=code == 0 and step_key == "develop")
+        selected_task_dir_before_refresh = self.latest_task_dir_var.get().strip()
+        should_force_latest = (
+            code == 0
+            and step_key == "develop"
+            and not (selected_task_dir_before_refresh and Path(selected_task_dir_before_refresh).exists())
+        )
+        self.refresh_temp_workspace_views(force_latest=should_force_latest)
+        if step_key == "develop" and selected_task_dir_before_refresh and Path(selected_task_dir_before_refresh).exists():
+            current_after_refresh = self.latest_task_dir_var.get().strip()
+            if self.normalize_path(current_after_refresh) != self.normalize_path(selected_task_dir_before_refresh):
+                self.latest_task_dir_var.set(selected_task_dir_before_refresh)
+                preferred_payload = self.workspace_manager.find_primary_payload_for_dir(selected_task_dir_before_refresh)
+                if preferred_payload:
+                    self.payload_var.set(str(preferred_payload))
+                self.set_task_local_excel_dirs(selected_task_dir_before_refresh)
+                self.fill_task_dir_listbox(selected_task_dir_before_refresh)
+                self.refresh_current_task_artifacts()
+                self.append_log(f"[workflow-guard] 已保持当前任务目录不被最新产物切走: {selected_task_dir_before_refresh}")
         if self.codex_runner.last_error_message:
             self.last_task_error_message = self.codex_runner.last_error_message
         elif self.claude_runner.last_error_message:
@@ -5324,19 +5702,35 @@ class SkillWriterApp:
             self.append_log(f"[workflow-retry] {retry_reason}")
             if self.schedule_develop_auto_retry(retry_reason):
                 return
+        if code == 0 and step_key == "copy":
+            _, _, failed_sync = self.sync_task_production_lua()
+            if failed_sync:
+                self.last_task_error_message = "Excel 副本写入成功，但生产 Lua 同步回工作目录失败，请查看 [finalize] 日志。"
+                code = 1
+        if code == 0 and step_key == "real":
+            _, _, failed_sync = self.sync_task_production_lua()
+            if failed_sync:
+                self.last_task_error_message = "正式 Excel 写回成功，但生产 Lua 同步回工作目录失败，请查看 [finalize] 日志。"
+                code = 1
+        if code != 0 and step_key in self.AUTO_REPAIRABLE_STEPS:
+            repair_reason = self.last_task_error_message or f"{task_name} 执行失败"
+            if self.schedule_step_auto_repair(task_name, step_key, repair_reason):
+                return
         if code == 0 and step_key == "real":
             self.current_archive_dir = self.archive_current_task()
         if code == 0 and step_key == "develop":
             self.mark_downstream_steps_dirty_after_develop()
+        if code == 0 and step_key in self.AUTO_REPAIRABLE_STEPS:
+            self.clear_auto_repair_attempt(step_key)
         history_entry = self.build_history_entry(task_name, code)
         self.history_entries = self.history_service.append(history_entry)
         self.refresh_history_view()
         if task_name == "续接修复" and self.active_repair_entry:
             assistant_text = ""
-            output_file = self.default_output_file()
+            output_file = self.current_output_file()
             if output_file.exists():
                 try:
-                    assistant_text = output_file.read_text(encoding="utf-8", errors="replace").strip()
+                    assistant_text = read_text_file(output_file).strip()
                 except Exception as exc:  # noqa: BLE001
                     assistant_text = f"读取模型输出失败: {exc}"
             if not assistant_text:
@@ -5373,12 +5767,47 @@ class SkillWriterApp:
         self.current_active_task_key = ""
         self.current_archive_dir = ""
         self.current_task_started_at = None
+        self.current_output_file_path = None
         self.status_var.set("就绪")
         self.set_task_stage("已完成" if code == 0 else "执行失败")
         self.append_log(f"[task] {task_name}结束，退出码: {code}")
         if code == 0 and self.task_name_to_step(task_name) == "real":
             self.finalize_after_real_writeback()
         self.update_action_buttons()
+        if task_name == "续接修复" and self.auto_repair_context:
+            auto_repair_context = self.auto_repair_context
+            self.auto_repair_context = None
+            original_task_name = str(auto_repair_context.get("task_name", "原步骤"))
+            original_step_key = str(auto_repair_context.get("step_key", ""))
+            serial_from_repair = bool(auto_repair_context.get("serial_active"))
+            rerun_mode = str(auto_repair_context.get("rerun_mode", "rerun_step"))
+            if code == 0:
+                self.last_task_error_message = ""
+                self.append_log(f"[workflow-retry] 自动修复完成，准备重跑步骤“{original_task_name}”。")
+                if rerun_mode == "finalize_real_after_sync":
+                    self.root.after(
+                        1200,
+                        lambda serial_from_repair=serial_from_repair: self.resume_after_real_writeback_repair(
+                            serial_from_repair
+                        ),
+                    )
+                elif serial_from_repair:
+                    self.root.after(1200, self.run_next_serial_step)
+                else:
+                    self.root.after(1200, lambda step_key=original_step_key: self.run_step_by_key(step_key))
+                return
+
+            self.append_log(f"[workflow-retry] 自动修复失败：步骤“{original_task_name}”仍未恢复。")
+            if serial_from_repair:
+                self.stop_serial_workflow(f"串行流程终止：自动修复“{original_task_name}”失败。")
+                self.update_action_buttons()
+            detail = f"自动修复失败：{original_task_name} 仍未恢复。"
+            if self.last_task_error_message:
+                detail += f"\n\n错误详情:\n{self.last_task_error_message}"
+            detail += f"\n\n完整日志:\n{self.full_log_path}"
+            self.show_log_tab()
+            messagebox.showwarning("提示", detail)
+            return
         if serial_context:
             self.handle_serial_task_result(task_name, code)
             return
@@ -5416,6 +5845,70 @@ class SkillWriterApp:
         removed, failed = self.cleanup_after_real_writeback()
         self.append_log(f"[finalize] 临时产物清理完成：删除 {removed} 项，失败 {failed} 项。")
         self.refresh_temp_workspace_views(force_latest=False)
+
+    def task_production_lua_targets(self) -> list[tuple[Path, Path]]:
+        task_dir_value = self.latest_task_dir_var.get().strip()
+        battle_root_value = self.battle_root_var.get().strip()
+        if not task_dir_value or not battle_root_value:
+            return []
+
+        task_dir = Path(task_dir_value)
+        battle_root = Path(battle_root_value)
+        if not task_dir.exists() or not battle_root.exists():
+            return []
+
+        candidate_roots = [task_dir / "scripts", task_dir]
+        targets: list[tuple[Path, Path]] = []
+        seen: set[str] = set()
+        for root in candidate_roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            for source in sorted(root.glob("*.lua")):
+                if not source.is_file():
+                    continue
+                if source.name.startswith("buff_"):
+                    destination = battle_root / "module" / "buffs_new" / source.name
+                elif source.name.startswith("action_"):
+                    destination = battle_root / "module" / "actions_new" / source.name
+                else:
+                    continue
+                source_key = str(source.resolve())
+                if source_key in seen:
+                    continue
+                seen.add(source_key)
+                targets.append((source, destination))
+        return targets
+
+    def sync_task_production_lua(self) -> tuple[int, int, int]:
+        targets = self.task_production_lua_targets()
+        if not targets:
+            self.append_log("[finalize] 未发现需要同步回工作目录的生产 Lua。")
+            return 0, 0, 0
+
+        synced = 0
+        unchanged = 0
+        failed = 0
+        for source, destination in targets:
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                action = "installed"
+                if destination.exists():
+                    if source.read_bytes() == destination.read_bytes():
+                        unchanged += 1
+                        self.append_log(f"[finalize] production lua unchanged: {source.name} -> {destination}")
+                        continue
+                    action = "updated"
+                shutil.copy2(source, destination)
+                synced += 1
+                self.append_log(f"[finalize] production lua {action}: {source} -> {destination}")
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                self.append_log(f"[finalize] production lua sync failed: {source} -> {destination} :: {exc}")
+
+        self.append_log(
+            f"[finalize] 生产 Lua 同步完成：新增/覆盖 {synced}，未变化 {unchanged}，失败 {failed}。"
+        )
+        return synced, unchanged, failed
 
     def archive_current_task(self) -> str:
         task_dir_value = self.latest_task_dir_var.get().strip()
@@ -5566,7 +6059,7 @@ class SkillWriterApp:
         return removed, failed
 
     def open_output_file(self) -> None:
-        output_file = self.default_output_file()
+        output_file = self.current_output_file()
         if output_file.exists():
             try:
                 os.startfile(str(output_file))

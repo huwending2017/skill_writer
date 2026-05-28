@@ -6,6 +6,7 @@ from typing import List
 
 from skill_writer_app.models import TaskHistoryEntry
 from skill_writer_app.services.mojibake_repair import repair_tree
+from skill_writer_app.services.text_decode import read_json_file
 
 
 class HistoryService:
@@ -17,7 +18,7 @@ class HistoryService:
         if not self.history_path.exists():
             return []
         try:
-            data = json.loads(self.history_path.read_text(encoding="utf-8"))
+            data = read_json_file(self.history_path)
         except (OSError, json.JSONDecodeError):
             return []
         repaired = repair_tree(data)

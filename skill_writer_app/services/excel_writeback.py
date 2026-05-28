@@ -137,7 +137,7 @@ class ExcelWritebackService:
                     return
                 run_command = normalize_windows_script_command(command)
                 log_queue.put("[writeback-cmd] " + subprocess.list2cmdline(run_command))
-                self.process = subprocess.Popen(
+                proc = subprocess.Popen(
                     run_command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
@@ -145,8 +145,9 @@ class ExcelWritebackService:
                     env=self._subprocess_env(),
                     **self._windows_subprocess_kwargs(),
                 )
-                assert self.process.stdout is not None
-                for line in self.process.stdout:
+                self.process = proc
+                assert proc.stdout is not None
+                for line in proc.stdout:
                     clean = decode_process_output(line).rstrip("\r\n")
                     if clean.startswith("[summary]"):
                         self.last_summary_lines.append(clean)
@@ -154,7 +155,7 @@ class ExcelWritebackService:
                         self.last_verify_lines.append(clean)
                     output_tail.append(clean)
                     log_queue.put(clean)
-                return_code = self.process.wait()
+                return_code = proc.wait()
                 if return_code != 0 and output_tail:
                     self.last_error_message = "\n".join(output_tail)
             except Exception as exc:  # noqa: BLE001

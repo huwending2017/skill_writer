@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from skill_writer_app.services.mojibake_repair import repair_tree
+from skill_writer_app.services.text_decode import read_json_file, read_text_file
 
 
 class TaskHandoffService:
@@ -35,9 +37,16 @@ class TaskHandoffService:
         if not path.exists():
             return {}
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = read_json_file(path)
         except (OSError, json.JSONDecodeError):
             return {}
+        repaired = repair_tree(data)
+        if repaired != data:
+            try:
+                path.write_text(json.dumps(repaired, ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+            data = repaired
         return data if isinstance(data, dict) else {}
 
     def build_memory(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +60,9 @@ class TaskHandoffService:
             "payload_path": data.get("payload_path", ""),
             "agent_backend": data.get("agent_backend", ""),
             "model_name": data.get("model_name", ""),
+            "global_lessons_path": data.get("global_lessons_path", ""),
+            "protected_runtime_paths": data.get("protected_runtime_paths", []),
+            "protected_runtime_baseline": data.get("protected_runtime_baseline", {}),
             "session_id": data.get("session_id", ""),
             "known_artifacts": data.get("artifacts", []),
             "requirement": data.get("skill_description", ""),
@@ -71,9 +83,16 @@ class TaskHandoffService:
         if not path.exists():
             return {}
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = read_json_file(path)
         except (OSError, json.JSONDecodeError):
             return {}
+        repaired = repair_tree(data)
+        if repaired != data:
+            try:
+                path.write_text(json.dumps(repaired, ensure_ascii=False, indent=2), encoding="utf-8")
+            except OSError:
+                pass
+            data = repaired
         return data if isinstance(data, dict) else {}
 
     def read_handoff(self, task_dir: str) -> str:
@@ -82,10 +101,7 @@ class TaskHandoffService:
         path = Path(task_dir) / self.HANDOFF_NAME
         if not path.exists():
             return ""
-        try:
-            return path.read_text(encoding="utf-8")
-        except OSError:
-            return ""
+        return read_text_file(path)
 
     def render_markdown(self, data: dict[str, Any]) -> str:
         completed = data.get("completed_steps", [])
@@ -100,6 +116,8 @@ class TaskHandoffService:
             f"- next_step: `{data.get('next_step', '')}`",
             f"- backend: `{data.get('agent_backend', '')}`",
             f"- model: `{data.get('model_name', '')}`",
+            f"- global_lessons_path: `{data.get('global_lessons_path', '')}`",
+            f"- protected_runtime_paths: `{', '.join(data.get('protected_runtime_paths', []) or [])}`",
             f"- session_id: `{data.get('session_id', '') or 'none'}`",
             f"- task_dir: `{data.get('task_dir', '')}`",
             f"- payload_path: `{data.get('payload_path', '')}`",

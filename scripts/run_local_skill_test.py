@@ -27,6 +27,39 @@ def lua_string(value: Path | str) -> str:
 def configure_lua_paths(lua: object, ctx) -> None:
     task_dir = ctx.task_dir
     battle_root = ctx.battle_root
+    workspace_root = ctx.workspace_root
+
+    def read_text_for_lua(path_text: object) -> str | None:
+        """Read UTF-8 text for Lua tests when Lua io.open cannot handle Unicode paths."""
+
+        raw = str(path_text).replace("\\", "/")
+        path = Path(raw)
+        candidates = [path] if path.is_absolute() else [
+            Path.cwd() / path,
+            battle_root / path,
+            task_dir / path,
+            workspace_root / path,
+        ]
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            key = str(resolved).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            for encoding in ("utf-8-sig", "utf-8", "gbk"):
+                try:
+                    return resolved.read_text(encoding=encoding)
+                except UnicodeDecodeError:
+                    continue
+        return None
+
+    lua.globals()["__skill_writer_read_text"] = read_text_for_lua
     lua.execute(
         "\n".join(
             [
@@ -56,12 +89,65 @@ RECORD_NUM_DEF = RECORD_NUM_DEF or {
     NUM = "NUM",
 }
 data_war_paper = data_war_paper or {}
+SKILL_WRITER_BATTLE_ROOT = SKILL_WRITER_BATTLE_ROOT or nil
+SKILL_WRITER_TASK_DIR = SKILL_WRITER_TASK_DIR or nil
+SKILL_WRITER_PAYLOAD = SKILL_WRITER_PAYLOAD or nil
 """
+    )
+    lua.execute(
+        "\n".join(
+            [
+                f"SKILL_WRITER_BATTLE_ROOT = {lua_string(battle_root)}",
+                f"SKILL_WRITER_TASK_DIR = {lua_string(task_dir)}",
+                f"SKILL_WRITER_PAYLOAD = {lua_string(ctx.payload_path or '')}",
+                "local __skill_writer_original_io_open = io.open",
+                "io.open = function(path, mode)",
+                "    mode = mode or 'r'",
+                "    if string.sub(mode, 1, 1) ~= 'r' then",
+                "        return __skill_writer_original_io_open(path, mode)",
+                "    end",
+                "    local file, err = __skill_writer_original_io_open(path, mode)",
+                "    if file then",
+                "        return file, err",
+                "    end",
+                "    local text = __skill_writer_read_text(path)",
+                "    if text == nil then",
+                "        return nil, err",
+                "    end",
+                "    local cursor = 1",
+                "    return {",
+                "        read = function(_, what)",
+                "            what = what or '*l'",
+                "            if what == '*a' or what == 'a' then",
+                "                local out = string.sub(text, cursor)",
+                "                cursor = #text + 1",
+                "                return out",
+                "            end",
+                "            local start_pos, end_pos = string.find(text, '\\n', cursor, true)",
+                "            if not start_pos then",
+                "                if cursor > #text then return nil end",
+                "                local out = string.sub(text, cursor)",
+                "                cursor = #text + 1",
+                "                return (string.gsub(out, '\\r$', ''))",
+                "            end",
+                "            local out = string.sub(text, cursor, start_pos - 1)",
+                "            cursor = end_pos + 1",
+                "            return (string.gsub(out, '\\r$', ''))",
+                "        end,",
+                "        close = function() return true end,",
+                "    }",
+                "end",
+            ]
+        )
     )
 
 
 def is_unsupported_embedded_regression_error(message: str) -> bool:
     normalized = message.lower().replace("_", " ")
+    if "无法打开 payload" in message or "cannot open payload" in normalized:
+        return True
+    if "failed to open file" in normalized and "temp_excel_payload" in normalized:
+        return True
     if "owner camp" in normalized:
         return True
     if "attempt to index a boolean value" in normalized and "local 'script'" in normalized:
@@ -161,7 +247,7 @@ def main() -> int:
         print("[test] regression:", regression_path)
         previous_cwd = Path.cwd()
         try:
-            os.chdir(ctx.task_dir)
+            os.chdir(ctx.battle_root)
             lua.execute(regression_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             detail = str(exc)

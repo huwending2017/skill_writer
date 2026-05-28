@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import json
 import locale
+from pathlib import Path
+from typing import Any
+
+
+_JSON_DEFAULT = object()
+_JSON_ENCODINGS = ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "gb18030", "gbk", "cp936")
 
 
 def decode_process_output(data: bytes) -> str:
     if not data:
         return ""
 
-    encodings = ["utf-8-sig", "utf-8", "gb18030"]
+    encodings = ["utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "gb18030"]
     preferred = locale.getpreferredencoding(False)
     if preferred and preferred.lower() not in {item.lower() for item in encodings}:
         encodings.append(preferred)
@@ -32,6 +39,42 @@ def decode_process_output(data: bytes) -> str:
     if best_text:
         return best_text
     return data.decode("utf-8", errors="replace")
+
+
+def read_text_file(path: Path, *, default: str = "") -> str:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return default
+    return decode_process_output(data)
+
+
+def read_json_file(path: Path, *, default: Any = _JSON_DEFAULT) -> Any:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        if default is not _JSON_DEFAULT:
+            return default
+        raise
+    for encoding in _JSON_ENCODINGS:
+        try:
+            text = data.decode(encoding).lstrip("\ufeff").replace("\x00", "")
+            return json.loads(text)
+        except (LookupError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    cleaned = data.decode("utf-8", errors="replace").lstrip("\ufeff").replace("\x00", "")
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        repaired = repair_mojibake(cleaned)
+        if repaired != cleaned:
+            try:
+                return json.loads(repaired)
+            except json.JSONDecodeError:
+                pass
+        if default is not _JSON_DEFAULT:
+            return default
+        raise
 
 
 def repair_mojibake(text: str) -> str:

@@ -6,7 +6,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skill_artifact_utils import TaskContext, ensure_payload_rows, load_json, normalize_excel_config_payload
+from payload_text_repair import auto_repair_payload_text_fields
+from skill_artifact_utils import (
+    TaskContext,
+    ensure_payload_rows,
+    load_json,
+    normalize_excel_config_payload,
+    normalize_skill_display_fields,
+    normalize_skill_stage_fields,
+    normalize_war_paper_display_fields,
+)
 
 
 DEFAULT_MAX_LEVEL = 10
@@ -52,10 +61,10 @@ def derive_war_key(row: dict[str, Any]) -> str:
 def normalize_row(sheet_name: str, raw_row: dict[str, Any]) -> dict[str, Any]:
     row = dict(raw_row)
     if sheet_name == "skill":
+        row = normalize_skill_display_fields(row)
         row["key"] = derive_skill_key(row)
     elif sheet_name == "skill_stage":
-        if "stage" not in row and "id" in row:
-            row["stage"] = row["id"]
+        row = normalize_skill_stage_fields(row)
         row["key"] = derive_stage_key(row)
         row["legacy_key"] = derive_stage_legacy_key(row)
     elif sheet_name == "buff":
@@ -69,6 +78,7 @@ def normalize_row(sheet_name: str, raw_row: dict[str, Any]) -> dict[str, Any]:
             row["name"] = row["record_name"]
         if "id" in row and "ID" not in row:
             row["ID"] = row["id"]
+        row = normalize_war_paper_display_fields(row)
     return row
 
 
@@ -144,7 +154,8 @@ def _expand_stage_rows(rows: list[dict[str, Any]], skill_rows: list[dict[str, An
     grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
     for row in rows:
         skill_id = _to_int(row.get("skill_id"), -1)
-        stage = _to_int(row.get("stage", row.get("id")), 0)
+        normalized_row = normalize_skill_stage_fields(row)
+        stage = _to_int(normalized_row.get("stage"), 1)
         grouped.setdefault((skill_id, stage), []).append(dict(row))
 
     expanded: list[dict[str, Any]] = []
@@ -480,6 +491,9 @@ def compile_payload_to_artifacts(ctx: TaskContext) -> CompileResult:
         raise ValueError("payload must contain rows object")
     payload = normalize_excel_config_payload(payload)
     payload = expand_payload_rows(payload)
+    payload, repair_notes = auto_repair_payload_text_fields(payload, ctx.task_dir)
+    for item in repair_notes:
+        print(f"[compile-repair] {item}")
     ctx.payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     temp_config_text, skill_keys, stage_keys, buff_keys, war_keys = build_temp_config_text(ctx, payload)

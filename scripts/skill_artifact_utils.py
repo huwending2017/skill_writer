@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import ast
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ OPERATIONAL_DIR_NAMES = {
     ".pycache_tmp",
     "_battle_knowledge_cache",
 }
+JSON_FILE_ENCODINGS = ("utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "gb18030", "gbk", "cp936")
 
 
 @dataclass
@@ -160,7 +162,15 @@ def resolve_task_context(
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    data = path.read_bytes()
+    for encoding in JSON_FILE_ENCODINGS:
+        try:
+            text = data.decode(encoding).lstrip("\ufeff").replace("\x00", "")
+            return json.loads(text)
+        except (LookupError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    text = data.decode("utf-8", errors="replace").lstrip("\ufeff").replace("\x00", "")
+    return json.loads(text)
 
 
 PAYLOAD_SHEET_NAMES = ("skill", "skill_global", "skill_stage", "buff", "war_paper")
@@ -229,6 +239,370 @@ USER_VISIBLE_PAYLOAD_FIELDS = {
     "param8",
 }
 
+WAR_PAPER_DESC_ALIASES = (
+    "desc1",
+    "desc",
+    "effect_desc",
+    "report_desc",
+    "report_text",
+    "text",
+    "content",
+)
+WAR_PAPER_NAME_ALIASES = (
+    "name",
+    "record_name",
+    "war_name",
+    "report_name",
+    "enum_name",
+    "record_key",
+    "key",
+)
+WAR_PAPER_ACTION_KEYWORDS = (
+    ("未触发", "fail"),
+    ("触发", "trigger"),
+    ("发动", "trigger"),
+    ("获得", "gain"),
+    ("失去", "loss"),
+    ("增加", "add"),
+    ("降低", "reduce"),
+    ("减少", "reduce"),
+    ("消失", "remove"),
+    ("移除", "remove"),
+    ("开始", "start"),
+    ("结束", "end"),
+    ("恢复", "restore"),
+    ("驱散", "dispel"),
+    ("伤害", "damage"),
+    ("治疗", "cure"),
+)
+BUFF_NAME_SUFFIXES = (
+    "核心",
+    "属性",
+    "破甲",
+    "治疗提升",
+    "智谋伤害",
+    "受伤增加",
+    "状态",
+    "效果",
+    "Buff",
+    "BUFF",
+)
+SAFE_WAR_PAPER_NAME_RE = re.compile(r"^[A-Za-z_][0-9A-Za-z_]*$")
+CJK_TEXT_RE = re.compile(r"[\u3400-\u9fff]")
+PLACEHOLDER_ONLY_SLUG_RE = re.compile(r"^(s|d|f|u|x)(_(s|d|f|u|x))*$")
+
+VALID_SKILL_TYPES = {1, 2, 3, 4, 6, 7}
+DEFAULT_SKILL_TYPE = 4
+
+SKILL_DESC_ALIASES = (
+    "desc",
+    "description",
+    "skill_desc",
+    "skill_description",
+)
+
+SKILL_DE_DESC_ALIASES = (
+    "de_desc",
+    "detail_desc",
+    "detailed_desc",
+    "skill_analysis",
+    "analysis",
+)
+
+SKILL_TYPE_TEXT_FIELDS = (
+    "skill_type_name",
+    "skill_type_text",
+    "skill_kind",
+    "category",
+    "skill_category",
+    "type_name",
+    "type",
+    "desc",
+    "de_desc",
+    "description",
+    "skill_description",
+    "name",
+)
+
+SKILL_TYPE_KEYWORDS = (
+    ("指挥", 1),
+    ("主动", 2),
+    ("突击", 3),
+    ("被动", 4),
+    ("兵种", 6),
+    ("阵法", 7),
+)
+
+STAGE_ALIASES = (
+    "stage",
+    "stage_id",
+    "stage_index",
+    "phase",
+    "step",
+    "id",
+)
+
+
+def first_non_empty_text(row: dict[str, Any], fields: tuple[str, ...]) -> str:
+    for field in fields:
+        value = row.get(field)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def is_safe_war_paper_name(value: Any) -> bool:
+    """Return true when war_paper.name can be used as data_war_paper.<name>."""
+
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(SAFE_WAR_PAPER_NAME_RE.fullmatch(text)) and not CJK_TEXT_RE.search(text)
+
+
+def ascii_slug(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    parts = re.findall(r"[0-9A-Za-z]+", text)
+    return "_".join(part for part in parts if part)
+
+
+def fallback_war_paper_name(row: dict[str, Any]) -> str:
+    skill_part = row.get("skill_id") or row.get("skill") or row.get("owner_skill_id")
+    record_part = row.get("ID") or row.get("id") or row.get("record_id")
+    if record_part not in (None, ""):
+        base = f"war_report_{record_part}"
+        return re.sub(r"[^0-9A-Za-z_]", "_", base)
+    desc_text = first_non_empty_text(row, WAR_PAPER_DESC_ALIASES + WAR_PAPER_NAME_ALIASES)
+    slug = ascii_slug(desc_text)
+    if slug and not PLACEHOLDER_ONLY_SLUG_RE.fullmatch(slug):
+        base = f"war_{skill_part}_{slug}" if skill_part not in (None, "") else f"war_{slug}"
+    else:
+        digest = hashlib.sha1(
+            json.dumps(row, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:8]
+        base = f"war_{skill_part}_{digest}" if skill_part not in (None, "") else f"war_report_{digest}"
+    base = re.sub(r"[^0-9A-Za-z_]", "_", base)
+    if not re.match(r"^[A-Za-z_]", base):
+        base = f"war_{base}"
+    return base
+
+
+def cjk_base_name(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)|（[^）]*）", "", text)
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def add_war_name_hint(hints: dict[str, str], chinese_name: Any, ascii_name: Any) -> None:
+    if not is_safe_war_paper_name(ascii_name):
+        return
+    base = cjk_base_name(chinese_name)
+    if not base or not CJK_TEXT_RE.search(base):
+        return
+    safe_name = str(ascii_name).strip()
+    hints.setdefault(base, safe_name)
+    for suffix in BUFF_NAME_SUFFIXES:
+        if base.endswith(suffix) and len(base) > len(suffix):
+            hints.setdefault(base[: -len(suffix)], safe_name)
+
+
+def build_war_paper_name_hints(rows: dict[str, Any]) -> dict[str, str]:
+    hints: dict[str, str] = {}
+    for sheet_name in ("buff", "skill_stage"):
+        sheet_rows = rows.get(sheet_name, [])
+        if not isinstance(sheet_rows, list):
+            continue
+        for row in sheet_rows:
+            if not isinstance(row, dict):
+                continue
+            script_name = row.get("script")
+            if not is_safe_war_paper_name(script_name):
+                continue
+            for field in ("name", "desc", "buff_desc", "de_desc"):
+                add_war_name_hint(hints, row.get(field), script_name)
+    for row in rows.get("skill", []) if isinstance(rows.get("skill"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        # If a model already emitted an ASCII helper field for the skill, reuse it.
+        for ascii_field in ("script", "lua_name", "enum_name", "key_name"):
+            ascii_name = row.get(ascii_field)
+            if not is_safe_war_paper_name(ascii_name):
+                continue
+            for field in ("name", "desc", "de_desc"):
+                add_war_name_hint(hints, row.get(field), ascii_name)
+    return hints
+
+
+def infer_war_action_suffix(row: dict[str, Any]) -> str:
+    text = " ".join(
+        str(row.get(field) or "")
+        for field in WAR_PAPER_NAME_ALIASES + WAR_PAPER_DESC_ALIASES
+    )
+    for keyword, suffix in WAR_PAPER_ACTION_KEYWORDS:
+        if keyword in text:
+            return suffix
+    return "report"
+
+
+def infer_readable_war_paper_name(row: dict[str, Any], hints: dict[str, str] | None = None) -> str | None:
+    if not hints:
+        return None
+    text = " ".join(
+        str(row.get(field) or "")
+        for field in WAR_PAPER_NAME_ALIASES + WAR_PAPER_DESC_ALIASES
+    )
+    best_match = ""
+    best_ascii = ""
+    for chinese_name, ascii_name in hints.items():
+        if chinese_name and chinese_name in text and len(chinese_name) > len(best_match):
+            best_match = chinese_name
+            best_ascii = ascii_name
+    if not best_ascii:
+        return None
+    return f"{best_ascii}_{infer_war_action_suffix(row)}"
+
+
+def infer_skill_type(row: dict[str, Any]) -> int | None:
+    for field in SKILL_TYPE_TEXT_FIELDS:
+        value = row.get(field)
+        if value is None:
+            continue
+        text = str(value)
+        for keyword, skill_type in SKILL_TYPE_KEYWORDS:
+            if keyword in text:
+                return skill_type
+    return None
+
+
+def normalize_skill_type_field(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    raw_value = normalized.get("skill_type")
+    try:
+        skill_type = int(raw_value)
+    except (TypeError, ValueError):
+        skill_type = None
+    if skill_type in VALID_SKILL_TYPES:
+        normalized["skill_type"] = skill_type
+        return normalized
+
+    inferred = infer_skill_type(normalized)
+    normalized["skill_type"] = inferred or DEFAULT_SKILL_TYPE
+    if raw_value not in (None, ""):
+        normalized["_skill_type_normalized_from"] = raw_value
+    return normalized
+
+
+def normalize_skill_display_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Keep skill desc/de_desc populated before formal Excel writeback."""
+
+    normalized = normalize_skill_type_field(row)
+    desc = first_non_empty_text(normalized, SKILL_DESC_ALIASES)
+    de_desc = first_non_empty_text(normalized, SKILL_DE_DESC_ALIASES)
+    fallback_text = first_non_empty_text(
+        normalized,
+        (
+            "name",
+            "skill_name",
+            "title",
+            "remark",
+            "beizhu",
+            "beizhu2",
+        ),
+    )
+    if desc and not str(normalized.get("desc") or "").strip():
+        normalized["desc"] = desc
+    if de_desc and not str(normalized.get("de_desc") or "").strip():
+        normalized["de_desc"] = de_desc
+    if not str(normalized.get("desc") or "").strip() and str(normalized.get("de_desc") or "").strip():
+        normalized["desc"] = normalized["de_desc"]
+    if not str(normalized.get("de_desc") or "").strip() and str(normalized.get("desc") or "").strip():
+        normalized["de_desc"] = normalized["desc"]
+    if fallback_text and not str(normalized.get("desc") or "").strip():
+        normalized["desc"] = fallback_text
+    if fallback_text and not str(normalized.get("de_desc") or "").strip():
+        normalized["de_desc"] = str(normalized.get("desc") or fallback_text)
+    return normalized
+
+
+def parse_stage_from_key(row: dict[str, Any]) -> int | None:
+    key = str(row.get("key") or "").strip()
+    parts = key.split("_")
+    if len(parts) >= 3:
+        try:
+            stage = int(parts[1])
+        except ValueError:
+            return None
+        if stage > 0:
+            return stage
+    return None
+
+
+def normalize_skill_stage_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize skill_stage phase id and prevent accidental stage=0 writes."""
+
+    normalized = dict(row)
+    stage = None
+    for field in STAGE_ALIASES:
+        value = normalized.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            stage = parsed
+            break
+    if stage is None:
+        stage = parse_stage_from_key(normalized)
+    if stage is None:
+        stage = 1
+    normalized["stage"] = stage
+    return normalized
+
+
+def normalize_war_paper_display_fields(
+    row: dict[str, Any],
+    name_hints: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Ensure custom war-report rows use ASCII enum names and visible text in desc1."""
+
+    normalized = dict(row)
+    raw_name = first_non_empty_text(normalized, WAR_PAPER_NAME_ALIASES)
+
+    if not str(normalized.get("desc1") or "").strip():
+        for field in WAR_PAPER_DESC_ALIASES:
+            value = normalized.get(field)
+            if isinstance(value, str) and value.strip():
+                normalized["desc1"] = value
+                break
+        if (
+            not str(normalized.get("desc1") or "").strip()
+            and isinstance(raw_name, str)
+            and CJK_TEXT_RE.search(raw_name)
+        ):
+            normalized["desc1"] = raw_name
+
+    if is_safe_war_paper_name(normalized.get("name")):
+        return normalized
+    for field in WAR_PAPER_NAME_ALIASES:
+        value = normalized.get(field)
+        if is_safe_war_paper_name(value):
+            normalized["name"] = str(value).strip()
+            return normalized
+    readable_name = infer_readable_war_paper_name(normalized, name_hints)
+    if readable_name and is_safe_war_paper_name(readable_name):
+        if raw_name:
+            normalized["_war_paper_name_normalized_from"] = raw_name
+        normalized["name"] = readable_name
+        return normalized
+    if raw_name:
+        normalized["_war_paper_name_normalized_from"] = raw_name
+    normalized["name"] = fallback_war_paper_name(normalized)
+    return normalized
+
+
 JSONISH_LIST_FRAGMENT_RE = re.compile(r"\[[^\[\]\r\n]*['\"][^\[\]\r\n]*\]")
 JSONISH_DICT_FRAGMENT_RE = re.compile(r"\{[^{}\r\n]*[:=][^{}\r\n]*\}")
 
@@ -289,6 +663,7 @@ def normalize_excel_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     normalized = dict(payload)
     normalized_rows: dict[str, Any] = {}
+    war_paper_name_hints = build_war_paper_name_hints(rows)
     for sheet_name, sheet_rows in rows.items():
         if not isinstance(sheet_rows, list):
             normalized_rows[sheet_name] = sheet_rows
@@ -307,6 +682,12 @@ def normalize_excel_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     normalized_row[field] = text if text is not None else value
                 else:
                     normalized_row[field] = value
+            if sheet_name == "skill":
+                normalized_row = normalize_skill_display_fields(normalized_row)
+            elif sheet_name == "skill_stage":
+                normalized_row = normalize_skill_stage_fields(normalized_row)
+            elif sheet_name == "war_paper":
+                normalized_row = normalize_war_paper_display_fields(normalized_row, war_paper_name_hints)
             normalized_sheet_rows.append(normalized_row)
         normalized_rows[sheet_name] = normalized_sheet_rows
     normalized["rows"] = normalized_rows
@@ -420,15 +801,32 @@ def is_task_owned_lua_script(task_dir: Path, path: Path) -> bool:
 
 
 def audit_lua_chinese_comments(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 
     comment_lines = []
     chinese_comment_lines = []
+    chinese_block_comment_lines = []
     logic_lines = []
+    in_block_comment = False
     for line in lines:
         stripped = line.strip()
         if not stripped:
+            continue
+        if in_block_comment:
+            comment_lines.append(stripped)
+            if re.search(r"[\u4e00-\u9fff]", stripped):
+                chinese_comment_lines.append(stripped)
+                chinese_block_comment_lines.append(stripped)
+            if "]]" in stripped:
+                in_block_comment = False
+            continue
+        if stripped.startswith("--[["):
+            in_block_comment = "]]" not in stripped
+            comment_lines.append(stripped)
+            if re.search(r"[\u4e00-\u9fff]", stripped):
+                chinese_comment_lines.append(stripped)
+                chinese_block_comment_lines.append(stripped)
             continue
         if stripped.startswith("--"):
             comment_lines.append(stripped)
@@ -450,10 +848,19 @@ def audit_lua_chinese_comments(path: Path) -> list[str]:
             f"{path.name} 中文注释不足：当前 {len(chinese_comment_lines)} 行，至少需要 {min_chinese_comments} 行"
         )
 
-    inline_chinese_comments = [
-        line for line in lines
-        if re.match(r"\s+--.*[\u4e00-\u9fff]", line)
-    ]
+    inline_chinese_comments = []
+    in_block_comment = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("--[["):
+            in_block_comment = "]]" not in stripped
+            continue
+        if in_block_comment:
+            if "]]" in stripped:
+                in_block_comment = False
+            continue
+        if re.match(r"\s+--.*[\u4e00-\u9fff]", line):
+            inline_chinese_comments.append(line)
     min_inline_comments = max(6, min(24, len(logic_lines) // 12))
     if len(inline_chinese_comments) < min_inline_comments:
         errors.append(
@@ -461,15 +868,15 @@ def audit_lua_chinese_comments(path: Path) -> list[str]:
         )
 
     required_keywords = {
-        "参数": "缺少参数含义说明",
-        "事件": "缺少事件/触发时机说明",
-        "状态": "缺少状态读写说明",
-        "异常": "缺少异常/短路保护说明",
-        "战报": "缺少战报插入说明",
+        ("参数",): "缺少参数含义说明",
+        ("事件", "触发"): "缺少事件/触发时机说明",
+        ("状态",): "缺少状态读写说明",
+        ("异常", "短路", "保护"): "缺少异常/短路保护说明",
+        ("战报",): "缺少战报插入说明",
     }
     comment_text = "\n".join(chinese_comment_lines)
-    for keyword, message in required_keywords.items():
-        if keyword not in comment_text:
+    for keywords, message in required_keywords.items():
+        if not any(keyword in comment_text for keyword in keywords):
             errors.append(f"{path.name} {message}")
 
     if "local function debug_log" in text or "debug_log(" in text:

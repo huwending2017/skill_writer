@@ -42,10 +42,11 @@ TEMPLATE_TEXT: Dict[str, str] = {
 4. 简单静态属性/伤害修正优先用配置：例如每层提高武器伤害、每层降低受到伤害，优先检查 buff_add_attr.lua / buff_add_attr_p.lua + data_attr_id，不能直接新增伤害监听脚本
 5. 临时产物放到 temp_skill_workspace 子目录，并且后续续接必须沿用同一目录
 6. 给出临时 skill / stage / buff / war_paper 配置；若技能描述写了“最大等级为 n / 满级 n / n 级”，skill、skill_stage、buff 必须生成 0-n 共 n+1 条；未写最大等级时默认补齐 0-10 级
-7. skill_stage 主键必须使用 技能id_阶段_等级；buff 主键必须使用 buff_id_等级
+7. skill_stage 主键必须使用 技能id_阶段_等级；skill_stage 的阶段字段必须写 stage=1/2/...，禁止写 0；buff 主键必须使用 buff_id_等级
+7.1 skill 行必须同时填写 desc 和 de_desc；skill_type 只能使用正式表已有类型 1/2/3/4/6/7，禁止臆造 8
 8. 生成需要的生产脚本，且脚本必须带详尽中文注释：文件头、参数含义、事件时机、状态读写、关键分支、异常保护、伤害/治疗/战报插入都要说明，不能只有少量标题注释；每个非平凡 local function / INTERFACE 方法前都要有中文注释；函数内部关键 if/return、层数变化、缓存读写、监听注册、临时失效恢复、战报清理、伤害改写和 provider 状态消费处也必须就地写中文注释
 8.1 新增或实质修改的生产脚本必须在真实逻辑行直接调用 DEBUG("[技能名]", ...) 排障日志，禁止封装 debug_log 包装函数，保证战斗日志行号指向实际分支；日志覆盖 init/uninit、事件分流、概率/阈值判定、状态变化、层数变化、目标数量、伤害/治疗值、战报 ID 和关键提前 return
-9. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+9. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号；war_paper.name 必须是可读英文枚举名（如 yuefei_report_country_gain、shen_sheng_zhi_zhe_trigger），禁止中文、空格、标点和纯 hash 命名；中文战报正文必须写入 desc1 字段，不能只写 desc
 9.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
 9.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
 10. 生产 Lua 必须自洽，不能依赖 test_skill_temp.lua、temp_skill_workspace、roll_skill_dice 或任何测试专用 helper
@@ -79,10 +80,11 @@ TEMPLATE_TEXT: Dict[str, str] = {
 6. 如果必须新增脚本，要说明为什么现有机制不够
 7. 临时产物统一放到 temp_skill_workspace/<bundle_name>/ 下，后续续接必须沿用同一目录
 8. 给出 bundle 级临时配置、脚本、测试方案；若技能描述写了“最大等级为 n / 满级 n / n 级”，skill、skill_stage、buff 必须生成 0-n 共 n+1 条；未写最大等级时默认补齐 0-10 级
-9. skill_stage 主键必须使用 技能id_阶段_等级；buff 主键必须使用 buff_id_等级
+9. skill_stage 主键必须使用 技能id_阶段_等级；skill_stage 的阶段字段必须写 stage=1/2/...，禁止写 0；buff 主键必须使用 buff_id_等级
+9.1 skill 行必须同时填写 desc 和 de_desc；skill_type 只能使用正式表已有类型 1/2/3/4/6/7，禁止臆造 8
 10. 新增生产脚本必须带详尽中文注释：文件头、参数含义、事件时机、状态读写、关键分支、异常保护、伤害/治疗/战报插入都要说明；每个非平凡 local function / INTERFACE 方法前都要有中文注释；函数内部关键 if/return、层数变化、缓存读写、监听注册、临时失效恢复、战报清理、伤害改写和 provider 状态消费处也必须就地写中文注释；同时必须自洽，不能依赖测试文件或测试专用 helper
 10.1 新增或实质修改的生产脚本必须在真实逻辑行直接调用 DEBUG("[技能名]", ...) 排障日志，禁止封装 debug_log 包装函数，保证战斗日志行号指向实际分支；日志覆盖 init/uninit、事件分流、概率/阈值判定、状态变化、层数变化、目标数量、伤害/治疗值、战报 ID 和关键提前 return
-11. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+11. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号；war_paper.name 必须是可读英文枚举名（如 yuefei_report_country_gain、shen_sheng_zhi_zhe_trigger），禁止中文、空格、标点和纯 hash 命名；中文战报正文必须写入 desc1 字段，不能只写 desc
 11.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
 11.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
 12. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
@@ -115,7 +117,7 @@ TEMPLATE_TEXT: Dict[str, str] = {
 7. 产物继续放在旧任务目录，或放到 temp_skill_workspace/<旧技能名>_iteration_<short_topic>，并说明为什么选择该目录
 8. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
 9. 更新 temp_excel_payload.json：包含新增技能配置、被迭代旧技能受影响的配置行，以及必要的 war_paper 行；未变化的旧配置不要无意义重写
-9.0 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+9.0 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号；war_paper.name 必须是可读英文枚举名（如 yuefei_report_country_gain、shen_sheng_zhi_zhe_trigger），禁止中文、空格、标点和纯 hash 命名；中文战报正文必须写入 desc1 字段，不能只写 desc
 9.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
 9.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
 9.1 对新旧行为差异补充 tests/regression_*.lua 或 tests/mechanism_*.lua 回归测试，至少覆盖旧逻辑不变和新机制生效两类场景
@@ -136,10 +138,10 @@ TEMPLATE_TEXT: Dict[str, str] = {
 3. 简单静态属性/伤害修正优先用 buff_add_attr.lua / buff_add_attr_p.lua 配置，不要直接新增伤害监听脚本
 4. 临时文件放到 temp_skill_workspace，续接时沿用同一任务目录
 5. 输出配置、脚本、测试；新增生产脚本必须带详尽中文注释，覆盖参数、事件、状态、关键分支、异常保护和战报插入；每个非平凡 local function / INTERFACE 方法前都要有中文注释；函数内部关键 if/return、层数变化、缓存读写、监听注册、临时失效恢复、战报清理、伤害改写和 provider 状态消费处也必须就地写中文注释；并在真实逻辑行直接补 DEBUG("[技能名]", ...) 排障日志，禁止 debug_log 包装函数
-6. 若技能描述写了“最大等级为 n / 满级 n / n 级”，skill、skill_stage、buff 必须生成 0-n 共 n+1 条；未写最大等级时默认补齐 0-10 级；skill_stage 主键使用 技能id_阶段_等级
+6. 若技能描述写了“最大等级为 n / 满级 n / n 级”，skill、skill_stage、buff 必须生成 0-n 共 n+1 条；未写最大等级时默认补齐 0-10 级；skill_stage 主键使用 技能id_阶段_等级，阶段字段必须写 stage=1/2/...，禁止写 0；skill 行必须同时填写 desc 和 de_desc；skill_type 只能使用正式表已有类型 1/2/3/4/6/7，禁止臆造 8
 7. 生产 Lua 必须自洽，不能依赖 test_skill_temp.lua 或测试专用 helper
 8. 单次任务目录统一使用 config/、scripts/、tests/、docs/、repair/、logs/ 子目录；payload 放在 config/temp_excel_payload.json
-9. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号
+9. 战报配置准则：不要把战报 ID 写进 buff.param / skill_stage.param；需要插入战报时，在对应生产 buff/action Lua 中用战报配置枚举或常量名引用，war_paper 行的 ID 留空，由 Excel 写回脚本按当前战报表最大 ID 自动续号；war_paper.name 必须是可读英文枚举名（如 yuefei_report_country_gain、shen_sheng_zhi_zhe_trigger），禁止中文、空格、标点和纯 hash 命名；中文战报正文必须写入 desc1 字段，不能只写 desc
 9.1 resident buff / 事件触发型 Buff 写战报时，不能只 make_effect_records；如果是在别的技能或伤害事件里响应，必须把 effect 通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回本次战报，否则日志会显示写了但前端战报不展示
 9.2 显示层数 Buff / overlying 只允许作为外观展示承载，真实业务层数必须保存在核心 Buff runtime 或明确的状态 Buff 中；BUFF_OVERLYING_EFFECT_FUNC 回调不能把显示 Buff 的 overlying 反写到真实 runtime，避免显示 Buff 被清理/重建成 0 时误清真实层数
 10. 对层数、指挥失效/恢复、清零但属性保留、驱散、死亡目标、首次/后续触发、战报展示值与内部值分离等机制，在 tests/ 下补充 regression_*.lua 或 mechanism_*.lua 回归测试
@@ -174,6 +176,20 @@ def build_prompt(
         + build_battle_report_rule_hint()
         + "\n\n"
         + build_excel_config_format_rule()
+        + "\n\n"
+        + build_protected_runtime_rule()
+    )
+
+
+def build_protected_runtime_rule() -> str:
+    return "\n".join(
+        [
+            "Protected runtime hard rule:",
+            "1. During skill continuation/repair, treat battle engine/runtime files as read-only references.",
+            "2. Do not modify module/object/actor.lua, module/fight/skill.lua, module/fight/buff.lua, module/fight/action.lua, module/fight/damage.lua, or module/scene/battle_scene.lua.",
+            "3. Unless the user explicitly asks for engine-level work, fix only the current task artifacts or the exact skill/buff/action script named by the user.",
+            "4. If an engine file appears to need changes, stop and explain the suspected engine limitation instead of editing it.",
+        ]
     )
 
 
@@ -187,6 +203,7 @@ def build_battle_report_rule_hint() -> str:
             "4. resident buff 或事件触发 Buff 响应其他技能/伤害事件时，不能只 make_effect_records；必须通过 extern.skill 的 clean_effect_record -> make_effect_records -> insert_effect_list(extern.skill, nil) 插回当前战报。",
             "5. 战报顺序必须贴近实际触发顺序；例如受到伤害时应按减伤说明、实际伤害、层数变化、层数转换、追加攻击/驱散/状态的顺序展示，不能无故延迟到回合结束。",
             "6. 百分比参数使用 RECORD_NUM_DEF.PERCENT_TYPE；war_paper 文本占位符与 Lua num_list 顺序必须一一对应。",
+            "7. war_paper.name 是 Lua 枚举 key，只能使用英文/数字/下划线且以字母或下划线开头，必须按技能/机制含义可读命名，例如 shen_sheng_zhi_zhe_trigger，绝不能写中文或纯 hash；中文战报文案只能放在 desc1。",
         ]
     )
 

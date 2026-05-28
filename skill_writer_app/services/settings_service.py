@@ -5,6 +5,7 @@ from pathlib import Path
 
 from skill_writer_app.models import AppSettings
 from skill_writer_app.services.mojibake_repair import repair_tree
+from skill_writer_app.services.text_decode import read_json_file
 
 
 class SettingsService:
@@ -14,7 +15,10 @@ class SettingsService:
     def load(self) -> AppSettings:
         if not self.settings_path.exists():
             return AppSettings()
-        data = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        try:
+            data = read_json_file(self.settings_path)
+        except json.JSONDecodeError:
+            return AppSettings()
         repaired = repair_tree(data)
         if repaired != data:
             self.settings_path.write_text(

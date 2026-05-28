@@ -140,6 +140,12 @@ python .\scripts\sync_bundled_skills.py
 
 自动串行可以覆盖大部分步骤，但正式 Excel 写回属于高风险步骤，建议保留人工确认。
 
+从本地预审开始，工具会尽量做“不中断式续接”：
+
+- `技能开发` 失败但已检测到可用产物时，会直接继续后续本地流程。
+- `本地预审 / 本地编译 / 技能测试 / 预览回写 / 写入 Excel 副本` 失败时，只要当前任务目录和 payload 仍可定位，工具会优先发起一次基于原任务目录的自动修复，再自动重跑原步骤。
+- 明显属于环境或人工处理问题的场景，例如 Python 不存在、battle_root 未定位、Excel 被其他进程锁定、配置目录缺失，工具不会盲目自动修复，而是直接提示人工处理。
+
 Excel 回写现在会额外输出结构化摘要：
 
 - 每个 sheet 新增 / 更新多少行
@@ -244,6 +250,19 @@ tests/mechanism_*.lua
 附件里的文本日志会自动尝试 UTF-8 / GBK 解码，并截取尾部关键内容放入修复 prompt；图片会作为证据路径传给模型。界面不再单独显示一个空的“会话对话”框，已有修复对话会合并显示在会话详情里。
 
 ## 正式 Excel 写回后的自动收尾
+
+正式 Excel 写回成功后，工具会自动执行收尾：
+
+写入 Excel 副本成功后，工具会立刻同步当前任务目录中的生产 Lua 回 battle 工程：
+
+```text
+temp_skill_workspace/<当前任务目录>/scripts/buff_*.lua
+  -> <battle_root>/module/buffs_new/
+temp_skill_workspace/<当前任务目录>/scripts/action_*.lua
+  -> <battle_root>/module/actions_new/
+```
+
+如果同步失败，“写入 Excel 副本”步骤会直接报错，不会假装成功。
 
 正式 Excel 写回成功后，工具会自动执行收尾：
 

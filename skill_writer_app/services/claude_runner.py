@@ -127,7 +127,13 @@ class ClaudeRunner:
             latest_session_id = ""
             final_result = ""
             try:
-                Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+                output_path = Path(output_file)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except OSError:
+                        output_path.write_text("", encoding="utf-8")
                 log_queue.put("[claude-cli] " + self.last_resolved_executable)
                 run_command = normalize_windows_script_command(command)
                 log_queue.put("[claude-cmd] " + subprocess.list2cmdline(run_command))
@@ -244,7 +250,7 @@ class ClaudeRunner:
                         log_queue.put(f"[claude-progress] event={payload_type} subtype={payload.get('subtype', '')}")
 
                 return_code = proc.wait()
-                Path(output_file).write_text(final_result, encoding="utf-8")
+                output_path.write_text(final_result, encoding="utf-8")
             except Exception as exc:  # noqa: BLE001
                 self.last_error_message = str(exc)
                 log_queue.put(f"[claude-error] {exc}")

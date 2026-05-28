@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from skill_writer_app.services.mojibake_repair import repair_tree
+from skill_writer_app.services.text_decode import read_json_file
 
 
 class WorkflowStateService:
@@ -13,7 +14,10 @@ class WorkflowStateService:
     def load(self) -> dict[str, dict[str, str]]:
         if not self.state_path.exists():
             return {}
-        data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        try:
+            data = read_json_file(self.state_path)
+        except json.JSONDecodeError:
+            return {}
         repaired = repair_tree(data)
         if repaired != data:
             self.state_path.write_text(json.dumps(repaired, ensure_ascii=False, indent=2), encoding="utf-8")

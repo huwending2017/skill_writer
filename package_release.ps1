@@ -399,7 +399,7 @@ if (-not $SkipBuild) {
         throw "Failed to sync bundled Codex skills"
     }
 
-    python -B -m PyInstaller --version *> $null
+    python -B -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[release] PyInstaller not found, installing from requirements-build.txt"
         python -m pip install -r (Join-Path $projectRoot "requirements-build.txt")

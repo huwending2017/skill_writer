@@ -111,7 +111,7 @@ class LocalScriptRunner:
                 log_queue.put("[local-script] " + str(resolved_script))
                 run_command = normalize_windows_script_command(command)
                 log_queue.put("[local-cmd] " + subprocess.list2cmdline(run_command))
-                self.process = subprocess.Popen(
+                proc = subprocess.Popen(
                     run_command,
                     cwd=workdir,
                     stdout=subprocess.PIPE,
@@ -120,10 +120,11 @@ class LocalScriptRunner:
                     env=self._subprocess_env(),
                     **self._windows_subprocess_kwargs(),
                 )
-                assert self.process.stdout is not None
-                for line in self.process.stdout:
+                self.process = proc
+                assert proc.stdout is not None
+                for line in proc.stdout:
                     log_queue.put(decode_process_output(line).rstrip("\r\n"))
-                return_code = self.process.wait()
+                return_code = proc.wait()
             except Exception as exc:  # noqa: BLE001
                 self.last_error_message = str(exc)
                 log_queue.put(f"[local-script-error] {exc}")

@@ -280,11 +280,20 @@ class CodexRunner:
             started_scan_at = time.time() - 3
             detected_session_id = ""
             try:
-                Path(output_file).parent.mkdir(parents=True, exist_ok=True)
+                output_path = Path(output_file)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except OSError:
+                        output_path.write_text("", encoding="utf-8")
+                prompt_file = output_path.with_name("last_codex_prompt.txt")
+                prompt_file.write_text(prompt, encoding="utf-8")
+                log_queue.put(f"[codex-prompt] chars={len(prompt)} saved={prompt_file}")
                 log_queue.put("[codex-cli] " + self.last_resolved_executable)
                 run_command = normalize_windows_script_command(command)
                 log_queue.put("[codex-cmd] " + subprocess.list2cmdline(run_command))
-                self.process = subprocess.Popen(
+                proc = subprocess.Popen(
                     run_command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
@@ -293,10 +302,11 @@ class CodexRunner:
                     env=self._subprocess_env(),
                     **self._windows_subprocess_kwargs(),
                 )
+                self.process = proc
 
-                assert self.process.stdin is not None
-                self.process.stdin.write(prompt.encode("utf-8"))
-                self.process.stdin.close()
+                assert proc.stdin is not None
+                proc.stdin.write(prompt.encode("utf-8"))
+                proc.stdin.close()
 
                 for _ in range(10):
                     detected_session_id, session_file = self.find_latest_session_for_workspace(
@@ -309,12 +319,12 @@ class CodexRunner:
                         break
                     time.sleep(0.3)
 
-                assert self.process.stdout is not None
+                assert proc.stdout is not None
                 stream_queue: Queue[Optional[bytes]] = Queue()
 
                 def read_stdout() -> None:
-                    assert self.process is not None and self.process.stdout is not None
-                    for stdout_line in self.process.stdout:
+                    assert proc.stdout is not None
+                    for stdout_line in proc.stdout:
                         stream_queue.put(stdout_line)
                     stream_queue.put(None)
 
@@ -325,7 +335,7 @@ class CodexRunner:
                     try:
                         raw_line = stream_queue.get(timeout=30)
                     except Empty:
-                        if self.process is not None and self.process.poll() is None:
+                        if proc.poll() is None:
                             idle_seconds = int(time.monotonic() - last_output_at)
                             log_queue.put(f"[codex-heartbeat] Codex 仍在运行，已 {idle_seconds} 秒无新输出。")
                             continue
@@ -363,7 +373,7 @@ class CodexRunner:
                 if folded_line_count:
                     self._flush_folded_output(log_queue, folded_line_count, folded_context)
 
-                return_code = self.process.wait()
+                return_code = proc.wait()
                 if not detected_session_id:
                     detected_session_id, session_file = self.find_latest_session_for_workspace(
                         workspace_root,
